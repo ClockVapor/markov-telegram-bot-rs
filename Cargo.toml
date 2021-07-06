@@ -1,0 +1,12 @@
+[package]
+name = "markov-telegram-bot-rs"
+version = "0.1.0"
+edition = "2018"
+
+[dependencies]
+clap = "2.33.3"
+telegram-bot = "0.8"
+futures = "0.3.15"
+tokio = { version = "0.2", features = ["full"]}
+mini-redis = "0.4"
+regex = "1"

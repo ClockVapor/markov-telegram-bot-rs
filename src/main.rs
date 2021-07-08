@@ -1,12 +1,15 @@
-use std::thread::park_timeout;
+use std::collections::HashMap;
 
 use clap::{App, Arg};
 use futures::StreamExt;
-use mini_redis;
-use telegram_bot::*;
+use mongodb::{Client, Database};
+use mongodb::bson::doc;
+use mongodb::options::ClientOptions;
+use serde::{Deserialize, Serialize};
+use telegram_bot::{Api, CanReplySendMessage, ChatId, Integer, Message, MessageEntity, MessageEntityKind, MessageKind, MessageText, Update, UpdateKind, User};
 
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), String> {
     let args = App::new("markov-telegram-bot-rs")
         .arg(Arg::with_name("TELEGRAM_BOT_TOKEN")
             .short("t")
@@ -37,7 +40,9 @@ async fn main() -> Result<(), Error> {
                     }
 
                     Some(BotAction::AddToMarkovChain(message)) => {
-                        add_to_markov_chain(message);
+                        if let Err(error) = add_to_markov_chain(message).await {
+                            println!("Failed to add message to markov chain: {:?}", error);
+                        }
                     }
 
                     None => {}
@@ -93,6 +98,7 @@ fn parse_text<'a>(message: &'a Message, text: &String, entities: &'a Vec<Message
                         }
                     }
                 }
+
                 "msgall" => {
                     println!("got /msgall");
                     return Some(BotAction::MsgAll(message));
@@ -106,17 +112,43 @@ fn parse_text<'a>(message: &'a Message, text: &String, entities: &'a Vec<Message
     None
 }
 
-fn add_to_markov_chain(message: &Message) -> Option<Error> {
+async fn add_to_markov_chain(message: &Message) -> Result<(), mongodb::error::Error> {
     match &message.text() {
         Some(text) => {
-            if !text.chars().all(|c| c.is_whitespace()) {
-                for word in text.split_whitespace() {}
-            }
-            todo!()
+            let chat_id = message.chat.id();
+            let mut chat_data = read_chat_data(chat_id)
+                .await?
+                .or_else(|| Some(ChatData { chat_id: chat_id.into(), chat_data: HashMap::new() }))
+                .unwrap();
+            chat_data.add_message(&message.from.id.into(), text);
+            write_chat_data(chat_data).await
         }
 
-        _ => None,
+        _ => Ok(()),
     }
+}
+
+async fn read_chat_data(chat_id: ChatId) -> Result<Option<ChatData>, mongodb::error::Error> {
+    let db = connect_to_db().await?;
+    let collection = db.collection_with_type::<ChatData>("chats");
+    let chat_id_raw: Integer = chat_id.into();
+    let option = collection.find_one(doc! {"chat_id": chat_id_raw}, None).await?;
+    println!("Read chat data {:?}", option);
+    Ok(option)
+}
+
+async fn write_chat_data(chat_data: ChatData) -> Result<(), mongodb::error::Error> {
+    let db = connect_to_db().await?;
+    let collection = db.collection_with_type::<ChatData>("chats");
+    collection.insert_one(chat_data, None).await?;
+    Ok(())
+}
+
+async fn connect_to_db() -> Result<Database, mongodb::error::Error> {
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    client_options.app_name = Some("markov-telegram-bot-rs".to_string());
+    let client = Client::with_options(client_options)?;
+    Ok(client.database("markov"))
 }
 
 /// Given a message's text and a `MessageEntity` within it, returns a `UserMention` if one is
@@ -135,6 +167,63 @@ fn get_user_mention<'a>(text: &String, entity: &'a MessageEntity) -> Option<User
         }
 
         _ => None,
+    }
+}
+
+// HashMap of userId to that user's markov chain in the group.
+#[derive(Serialize, Deserialize, Debug)]
+struct ChatData {
+    chat_id: Integer,
+    chat_data: HashMap<Integer, MarkovChain>,
+}
+
+impl ChatData {
+    fn add_message(&mut self, user_id: &Integer, text: &String) {
+        if self.chat_data.contains_key(user_id) {
+            let markov_chain = self.chat_data.get_mut(user_id).unwrap();
+            markov_chain.add_message(text);
+        } else {
+            let mut markov_chain = MarkovChain { user_id: *user_id, markov_chain: HashMap::new() };
+            markov_chain.add_message(text);
+            self.chat_data.insert(user_id.clone(), markov_chain);
+        }
+    }
+}
+
+// HashMap of word (#1) to HashMap of following word (#2) to number of times #2 followed #1.
+#[derive(Serialize, Deserialize, Debug)]
+struct MarkovChain {
+    user_id: Integer,
+    markov_chain: HashMap<String, HashMap<String, u32>>,
+}
+
+impl MarkovChain {
+    fn add_message(&mut self, text: &String) {
+        let mut words = text.split_whitespace().peekable();
+        if let Some(_) = words.peek() {
+            let mut last_word = "";
+            for word in words {
+                match self.markov_chain.get_mut(last_word) {
+                    Some(word_map) => {
+                        match word_map.get(word) {
+                            Some(count) => {
+                                let new_count = count + 1;
+                                word_map.insert(word.to_owned(), new_count);
+                            }
+                            None => {
+                                word_map.insert(word.to_owned(), 1);
+                            }
+                        }
+                    }
+                    None => {
+                        let mut word_map = HashMap::new();
+                        word_map.insert(word.to_owned(), 1);
+                        self.markov_chain.insert(last_word.to_owned(), word_map);
+                    }
+                }
+                last_word = word;
+            }
+        }
     }
 }
 

@@ -196,7 +196,7 @@ async fn write_chat_data(chat_data: ChatData) -> Result<(), mongodb::error::Erro
 }
 
 async fn connect_to_db() -> Result<Database, mongodb::error::Error> {
-    let mut client_options = ClientOptions::parse("mongodb://localhost:27017").await?;
+    let mut client_options = ClientOptions::parse("mongodb://localhost:27017/?connectTimeoutMS=3000").await?;
     client_options.app_name = Some("markov-telegram-bot-rs".to_owned());
     let client = Client::with_options(client_options)?;
     Ok(client.database("markov"))

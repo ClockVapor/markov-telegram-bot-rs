@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use rand::prelude::IteratorRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +29,7 @@ impl MarkovChain {
             None => {
                 match self.markov_chain.get("") {
                     None => return Err(MarkovChainError::Empty),
-                    Some(word_map) => word_map.keys().choose(&mut rand::thread_rng()).unwrap().clone(),
+                    Some(starting_word_map) => choose_from_frequency_map(starting_word_map).clone()
                 }
             }
         };
@@ -44,25 +43,7 @@ impl MarkovChain {
                     return Err(MarkovChainError::InternalError);
                 }
                 Some(word_map) => {
-                    let mut cumulative_distribution: Vec<(i32, &String)> = vec![];
-                    let mut n = 0;
-                    for (following_word, count) in word_map {
-                        n += count;
-                        cumulative_distribution.push((n, following_word));
-                    }
-                    let random = rand::thread_rng().gen_range(0..n);
-                    let mut next_word: Option<String> = None;
-                    for (cumulative_value, following_word) in cumulative_distribution {
-                        if random < cumulative_value {
-                            next_word = Some(following_word.clone());
-                            break;
-                        }
-                    }
-                    if next_word == None { // Should never happen
-                        println!("Failed to pick next word in cumulative distribution");
-                        return Err(MarkovChainError::InternalError);
-                    }
-                    word = next_word.unwrap();
+                    word = choose_from_frequency_map(word_map).clone();
                 }
             }
         }
@@ -115,4 +96,21 @@ pub enum MarkovChainError {
 
     /// Catch-all for unexpected markov chain errors.
     InternalError,
+}
+
+fn choose_from_frequency_map<T>(map: &HashMap<T, i32>) -> &T {
+    let mut cumulative_distribution: Vec<(&T, i32)> = vec![];
+    let mut running_total = 0;
+    for (item, count) in map {
+        running_total += count;
+        cumulative_distribution.push((item, running_total));
+    }
+
+    let random = rand::thread_rng().gen_range(0..running_total);
+    for (item, cumulative_value) in cumulative_distribution {
+        if random < cumulative_value {
+            return item;
+        }
+    }
+    panic!("Failed to choose random item from cumulative distribution");
 }

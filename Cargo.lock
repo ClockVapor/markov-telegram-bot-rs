@@ -816,6 +816,7 @@ dependencies = [
  "clap",
  "futures",
  "mongodb",
+ "rand 0.8.4",
  "serde",
  "telegram-bot",
  "tokio",

@@ -2,11 +2,14 @@ use std::collections::HashMap;
 
 use clap::{App, Arg};
 use futures::StreamExt;
+use MessageEntityKind::{BotCommand, Mention, TextMention};
 use mongodb::{Client, Database};
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ReplaceOptions};
 use serde::{Deserialize, Serialize};
-use telegram_bot::{Api, CanReplySendMessage, ChatId, Integer, Message, MessageEntity, MessageEntityKind, MessageKind, MessageText, Update, UpdateKind, User};
+use telegram_bot::{Api, CanReplySendMessage, ChatId, Integer, Message, MessageEntity, MessageEntityKind, MessageKind,
+                   MessageText, Update, UpdateKind, User};
+
 use markov_chain::*;
 
 mod markov_chain;
@@ -54,21 +57,13 @@ async fn handle_message(api: &Api, message: &Message) {
     if let Some(text) = &message.text() {
         // Check for bot commands
         if let MessageKind::Text { ref entities, .. } = message.kind {
-            if let Some(MessageEntity { kind: MessageEntityKind::BotCommand, ref offset, ref length }) = entities.get(0) {
+            if let Some(MessageEntity { kind: BotCommand, ref offset, ref length }) = entities.get(0) {
                 match text.get((offset + 1) as usize..(offset + length) as usize) {
                     Some(command_text) => {
                         if command_text == "msg" || command_text.starts_with("msg@") {
                             let reply_text = if let Some(entity) = entities.get(1) {
                                 if let Some(user_mention) = get_user_mention(text, entity) {
-                                    let seed = if let Some(rest) = text.get((entity.offset + entity.length) as usize..) {
-                                        let rest_parts: Vec<&str> = rest.split_whitespace().collect();
-                                        if rest_parts.len() == 1 {
-                                            Ok(Some(rest_parts.get(0).unwrap().to_string()))
-                                        } else if rest_parts.len() > 1 {
-                                            Err("<up to one seed word can be provided>".to_owned())
-                                        } else { Ok(None) }
-                                    } else { Ok(None) };
-                                    match seed {
+                                    match get_seed(text.get((entity.offset + entity.length) as usize..)) {
                                         Err(e) => Some(e),
                                         Ok(seed) => {
                                             println!("Got /msg for {:?}", user_mention);
@@ -95,13 +90,29 @@ async fn handle_message(api: &Api, message: &Message) {
 
                     _ => {}
                 }
+                return; // Don't add bot command messages to the Markov chain
             }
         }
 
         // If message was not handled by some bot command, add it to the sending user's markov chain
         if let Err(e) = add_to_markov_chain(message).await {
-            println!("Failed to add message to markov chain: {:?}", e);
+            println!("Failed to add message to Markov chain: {:?}", e);
         };
+    }
+}
+
+/// Parses up to one seed value from the given optional string. Err is returned if more than one seed value is given.
+fn get_seed(text: Option<&str>) -> Result<Option<String>, String> {
+    match text {
+        Some(text) => {
+            let parts: Vec<&str> = text.split_whitespace().collect();
+            if parts.len() == 1 {
+                Ok(Some(parts.get(0).unwrap().to_string()))
+            } else if parts.len() > 1 {
+                Err("<up to one seed word can be provided>".to_owned())
+            } else { Ok(None) }
+        }
+        None => Ok(None),
     }
 }
 
@@ -120,7 +131,9 @@ async fn remember_message_sender(message: &Message) -> Result<(), mongodb::error
     Ok(())
 }
 
-async fn do_msg_command<'a>(chat_id: &ChatId, target_user_mention: &UserMention<'a>, seed: Option<String>) -> Result<Option<String>, MsgCommandError> {
+async fn do_msg_command<'a>(chat_id: &ChatId,
+                            target_user_mention: &UserMention<'a>,
+                            seed: Option<String>) -> Result<Option<String>, MsgCommandError> {
     match target_user_mention.user_id().await {
         Err(e) => Err(MsgCommandError::DbError(e)),
         Ok(None) => Ok(None),
@@ -129,7 +142,7 @@ async fn do_msg_command<'a>(chat_id: &ChatId, target_user_mention: &UserMention<
                 Err(e) => Err(MsgCommandError::DbError(e)),
                 Ok(None) => Ok(None),
                 Ok(Some(chat_data)) => {
-                    match chat_data.chat_data.get(&user_id) {
+                    match chat_data.data.get(&user_id) {
                         None => Ok(None),
                         Some(markov_chain) => {
                             match markov_chain.generate(seed) {
@@ -160,7 +173,7 @@ async fn add_to_markov_chain(message: &Message) -> Result<(), mongodb::error::Er
             let chat_id_str = chat_id_raw.to_string();
             let mut chat_data = read_chat_data(&chat_id)
                 .await?
-                .or_else(|| Some(ChatData { chat_id: chat_id_str, chat_data: HashMap::new() }))
+                .or_else(|| Some(ChatData { chat_id: chat_id_str, data: HashMap::new() }))
                 .unwrap();
             let sender_id_raw: Integer = message.from.id.into();
             let sender_id_str = sender_id_raw.to_string();
@@ -202,18 +215,17 @@ async fn connect_to_db() -> Result<Database, mongodb::error::Error> {
     Ok(client.database("markov"))
 }
 
-/// Given a message's text and a `MessageEntity` within it, returns a `UserMention` if one is
-/// present.
+/// Given a message's text and a `MessageEntity` within it, returns a `UserMention` if one is present.
 fn get_user_mention<'a>(text: &String, entity: &'a MessageEntity) -> Option<UserMention<'a>> {
     match &entity.kind {
-        MessageEntityKind::Mention => {
+        Mention => {
             let username = text.get((entity.offset + 1) as usize..
                 (entity.offset + entity.length) as usize
             )?.to_owned();
             Some(UserMention::AtMention(username))
         }
 
-        MessageEntityKind::TextMention(user) => {
+        TextMention(user) => {
             Some(UserMention::TextMention(user))
         }
 
@@ -221,26 +233,31 @@ fn get_user_mention<'a>(text: &String, entity: &'a MessageEntity) -> Option<User
     }
 }
 
-// HashMap of userId to that user's markov chain in the group.
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatData {
+    /// ID of the Telegram chat that this data belongs to.
     chat_id: String,
-    chat_data: HashMap<String, MarkovChain>,
+
+    /// HashMap from a Telegram user's ID to their Markov chain.
+    data: HashMap<String, MarkovChain>,
 }
 
 impl ChatData {
+    /// Adds a Telegram message to a user's Markov chain.
     fn add_message(&mut self, user_id: &String, text: &String) {
-        if self.chat_data.contains_key(user_id) {
-            let markov_chain = self.chat_data.get_mut(user_id).unwrap();
+        if self.data.contains_key(user_id) {
+            let markov_chain = self.data.get_mut(user_id).unwrap();
             markov_chain.add_message(text);
         } else {
-            let mut markov_chain = MarkovChain { user_id: user_id.clone(), markov_chain: HashMap::new() };
+            let mut markov_chain = MarkovChain { user_id: user_id.clone(), data: HashMap::new() };
             markov_chain.add_message(text);
-            self.chat_data.insert(user_id.clone(), markov_chain);
+            self.data.insert(user_id.clone(), markov_chain);
         }
     }
 }
 
+/// Data structure used to map a Telegram user's username to their user ID, as the Telegram bot API has no way to
+/// fetch this relationship.
 #[derive(Serialize, Deserialize, Debug)]
 struct UserInfo {
     username: String,
@@ -257,6 +274,8 @@ enum UserMention<'a> {
 }
 
 impl<'a> UserMention<'a> {
+    /// If the mention is a TextMention, simply returns the linked user's ID.
+    /// If the mention is an AtMention, fetches the user ID that maps to the username from the database.
     async fn user_id(&self) -> Result<Option<String>, mongodb::error::Error> {
         match self {
             UserMention::AtMention(username) => {

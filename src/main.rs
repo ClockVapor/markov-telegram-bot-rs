@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use clap::{App, Arg};
 use futures::StreamExt;
+use log::{debug, error};
 use MessageEntityKind::{BotCommand, Mention, TextMention};
 use mongodb::{Client, Database};
 use mongodb::bson::doc;
@@ -13,6 +14,9 @@ use telegram_bot::{Api, CanReplySendMessage, ChatId, Integer, Message, MessageEn
 use markov_chain::*;
 
 mod markov_chain;
+
+/// "User ID" for Markov chain of all users.
+const ALL: String = "all".to_owned();
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
@@ -36,7 +40,7 @@ async fn main() -> Result<(), String> {
 			}
 
 			Err(error) => {
-				println!("Failed to fetch update: {:?}", error);
+				error!("Failed to fetch update: {:?}", error);
 			}
 		}
 	}
@@ -51,44 +55,53 @@ async fn handle_update(api: &Api, update: &Update) {
 
 async fn handle_message(api: &Api, message: &Message) {
 	if let Err(e) = remember_message_sender(message).await {
-		println!("Failed to remember user {:?}: {:?}", message.from, e);
+		error!("Failed to remember user {:?}: {:?}", message.from, e);
 	}
 
 	if let Some(text) = &message.text() {
 		// Check for bot commands
 		if let MessageKind::Text { ref entities, .. } = message.kind {
 			if let Some(MessageEntity { kind: BotCommand, ref offset, ref length }) = entities.get(0) {
-				match text.get((offset + 1) as usize..(offset + length) as usize) {
-					Some(command_text) => {
-						if command_text == "msg" || command_text.starts_with("msg@") {
-							let reply_text = if let Some(entity) = entities.get(1) {
-								if let Some(user_mention) = get_user_mention(text, entity) {
-									match get_seed(text.get((entity.offset + entity.length) as usize..)) {
-										Err(e) => Some(e),
-										Ok(seed) => {
-											println!("Got /msg for {:?}", user_mention);
-											match do_msg_command(&message.chat.id(), &user_mention, seed).await {
-												Ok(Some(text)) => Some(text),
-												Ok(None) => Some("<no data>".to_owned()),
-												Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) =>
-													Some("<no such seed>".to_owned()),
-												Err(e) => {
-													println!("An error occurred executing /msg command: {:?}", e);
-													Some("<an error occurred>".to_owned())
-												}
-											}
+				if let Some(command_text) = text.get((offset + 1) as usize..(offset + length) as usize) {
+					if command_text == "msg" || command_text.starts_with("msg@") {
+						let (source, mention_entity) = if let Some(entity) = entities.get(1) {
+							if let Some(user_mention) = get_user_mention(text, entity) {
+								(Source::SingleUser(user_mention), Some(entity))
+							} else {
+								(Source::AllUsers, None)
+							}
+						} else {
+							(Source::AllUsers, None)
+						};
+						let reply_text = {
+							let seed = match source {
+								Source::SingleUser(_) =>
+									get_seed(text.get((mention_entity.unwrap().offset + mention_entity.unwrap().length) as usize..)),
+								Source::AllUsers => get_seed(text.get((offset + length) as usize..)),
+							};
+							match seed {
+								Err(e) => e,
+								Ok(seed) => {
+									debug!("Got /msg for {:?}", source);
+									match do_msg_command(&message.chat.id(), &source, seed).await {
+										Ok(Some(text)) => text,
+										Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) =>
+											"<no data>".to_owned(),
+										Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) =>
+											"<no such seed>".to_owned(),
+										Err(e) => {
+											error!("An error occurred executing /msg command: {:?}", e);
+											"<an error occurred>".to_owned()
 										}
 									}
-								} else { None }
-							} else { None }.unwrap_or("<expected a user mention>".to_owned());
-							if let Err(e) = api.send(message.text_reply(reply_text)).await {
-								println!("Failed to send reply: {:?}", e);
+								}
 							}
-							return;
+						};
+						if let Err(e) = api.send(message.text_reply(reply_text)).await {
+							error!("Failed to send reply: {:?}", e);
 						}
+						return;
 					}
-
-					_ => {}
 				}
 				return; // Don't add bot command messages to the Markov chain
 			}
@@ -96,7 +109,7 @@ async fn handle_message(api: &Api, message: &Message) {
 
 		// If message was not handled by some bot command, add it to the sending user's markov chain
 		if let Err(e) = add_to_markov_chain(message).await {
-			println!("Failed to add message to Markov chain: {:?}", e);
+			error!("Failed to add message to Markov chain: {:?}", e);
 		};
 	}
 }
@@ -116,6 +129,7 @@ fn get_seed(text: Option<&str>) -> Result<Option<String>, String> {
 	}
 }
 
+/// Stores the message sender's username and user ID so that their username can be associated with their user ID.
 async fn remember_message_sender(message: &Message) -> Result<(), mongodb::error::Error> {
 	if let Some(username) = &message.from.username {
 		let username = username.to_lowercase();
@@ -126,15 +140,19 @@ async fn remember_message_sender(message: &Message) -> Result<(), mongodb::error
 		user_infos.replace_one(doc! {"username": &username},
 		                       UserInfo { username: username.clone(), user_id: message.from.id.to_string() },
 		                       replace_options).await?;
-		println!("Remembered username {} has user_id {}", &username, message.from.id.to_string());
+		debug!("Remembered username {} has user_id {}", &username, message.from.id.to_string());
 	}
 	Ok(())
 }
 
 async fn do_msg_command<'a>(chat_id: &ChatId,
-                            target_user_mention: &UserMention<'a>,
+                            source: &Source<'a>,
                             seed: Option<String>) -> Result<Option<String>, MsgCommandError> {
-	match target_user_mention.user_id().await {
+	let user_id = match source {
+		Source::SingleUser(target_user_mention) => target_user_mention.user_id().await,
+		Source::AllUsers => Ok(Some(ALL)),
+	};
+	match user_id {
 		Err(e) => Err(MsgCommandError::DbError(e)),
 		Ok(None) => Ok(None),
 		Ok(Some(user_id)) => {
@@ -166,7 +184,14 @@ enum MsgCommandError {
 }
 
 async fn add_to_markov_chain(message: &Message) -> Result<(), mongodb::error::Error> {
-	match &message.text() {
+	let text = match &message.kind {
+		MessageKind::Text { data, .. } => Some(data),
+		MessageKind::Photo { caption, .. } => caption.as_ref(),
+		MessageKind::Video { caption, .. } => caption.as_ref(),
+		MessageKind::Document { caption, .. } => caption.as_ref(),
+		_ => None,
+	};
+	match text {
 		Some(text) => {
 			let chat_id = message.chat.id();
 			let chat_id_raw: Integer = chat_id.into();
@@ -177,7 +202,8 @@ async fn add_to_markov_chain(message: &Message) -> Result<(), mongodb::error::Er
 				.unwrap();
 			let sender_id_raw: Integer = message.from.id.into();
 			let sender_id_str = sender_id_raw.to_string();
-			chat_data.add_message(&sender_id_str, text);
+			chat_data.add_message(&sender_id_str, text); // Add to the specific user's Markov chain
+			chat_data.add_message(&ALL, text); // Also add to the "all users" Markov chain
 			write_chat_data(chat_data).await
 		}
 
@@ -191,7 +217,7 @@ async fn read_chat_data(chat_id: &ChatId) -> Result<Option<ChatData>, mongodb::e
 	let db = connect_to_db().await?;
 	let collection = db.collection_with_type::<ChatData>("chats");
 	let option = collection.find_one(doc! {"chat_id": chat_id_str}, None).await?;
-	println!("Read chat data {:?}", option);
+	debug!("Read chat data {:?}", option);
 	Ok(option)
 }
 
@@ -200,11 +226,11 @@ async fn write_chat_data(chat_data: ChatData) -> Result<(), mongodb::error::Erro
 	let collection = db.collection_with_type::<ChatData>("chats");
 	let mut replace_options = ReplaceOptions::default();
 	replace_options.upsert = Some(true);
-	let msg = format!("Wrote chat data {:?}", chat_data);
+	let msg = format!("Wrote chat data {:?}", chat_data.chat_id);
 	collection.replace_one(doc! {"chat_id": chat_data.chat_id.clone()},
 	                       chat_data,
 	                       Some(replace_options)).await?;
-	println!("{}", msg);
+	debug!("{}", msg);
 	Ok(())
 }
 
@@ -220,8 +246,7 @@ fn get_user_mention<'a>(text: &String, entity: &'a MessageEntity) -> Option<User
 	match &entity.kind {
 		Mention => {
 			let username = text.get((entity.offset + 1) as usize..
-				(entity.offset + entity.length) as usize
-			)?.to_owned();
+				(entity.offset + entity.length) as usize)?.to_owned();
 			Some(UserMention::AtMention(username))
 		}
 
@@ -265,6 +290,12 @@ struct UserInfo {
 }
 
 #[derive(Debug)]
+enum Source<'a> {
+	SingleUser(UserMention<'a>),
+	AllUsers,
+}
+
+#[derive(Debug)]
 enum UserMention<'a> {
 	/// A mention of the form @username. The contained String will not include the leading @.
 	AtMention(String),
@@ -283,7 +314,7 @@ impl<'a> UserMention<'a> {
 				let db = connect_to_db().await?;
 				let user_infos = db.collection_with_type::<UserInfo>("user_infos");
 				let user_info = user_infos.find_one(doc! {"username": &username}, None).await?;
-				println!("Read user info for username {}: {:?}", &username, user_info);
+				debug!("Read user info for username {}: {:?}", &username, user_info);
 				Ok(user_info.map(|o| o.user_id))
 			}
 			UserMention::TextMention(user) => Ok(Some(user.id.to_string())),

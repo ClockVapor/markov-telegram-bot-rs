@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use log::error;
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -46,7 +47,7 @@ impl MarkovChain {
 			result.push(word.clone());
 			match self.data.get(&word) {
 				None => { // Should never happen based on how we build the markov chains
-					println!("Expected word {} to be in the markov chain but it wasn't", word);
+					error!("Expected word {} to be in the Markov chain but it wasn't", word);
 					return Err(InternalError);
 				}
 				Some(word_map) => {

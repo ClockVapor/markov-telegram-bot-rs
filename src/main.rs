@@ -9,7 +9,8 @@ use mongodb::{Client, Database};
 use serde::{Deserialize, Serialize};
 use telegram_bot::{
     Api, CanReplySendMessage, ChatId, Integer, Message, MessageEntity, MessageEntityKind,
-    MessageKind, MessageText, Update, UpdateKind, User,
+    MessageId, MessageKind, MessageOrChannelPost, MessageText, ToMessageId, Update, UpdateKind,
+    User, UserId,
 };
 use MessageEntityKind::{BotCommand, Mention, TextMention};
 
@@ -17,7 +18,7 @@ use markov_chain::*;
 
 mod markov_chain;
 
-/// "User ID" for Markov chain of all users.
+/// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &'static str = "all";
 
 const CHATS_COLLECTION_NAME: &'static str = "chats";
@@ -39,107 +40,228 @@ async fn main() -> Result<(), String> {
         )
         .get_matches();
 
-    let token = args.value_of("TELEGRAM_BOT_TOKEN").unwrap();
-    let api = Api::new(token);
+    let bot_token = args.value_of("TELEGRAM_BOT_TOKEN").unwrap();
+    MarkovTelegramBot::new().run(bot_token).await
+}
 
-    let mut stream = api.stream();
-    while let Some(update) = stream.next().await {
-        match update {
-            Ok(update) => {
-                handle_update(&api, &update).await;
-            }
+#[derive(Default)]
+struct MarkovTelegramBot {
+    prompts: HashMap<ChatId, HashMap<UserId, Prompt>>,
+}
 
-            Err(error) => {
-                error!("Failed to fetch update: {:?}", error);
+impl MarkovTelegramBot {
+    fn new() -> Self {
+        Default::default()
+    }
+
+    async fn run(&mut self, bot_token: &str) -> Result<(), String> {
+        let api = Api::new(bot_token);
+        let mut stream = api.stream();
+        while let Some(update) = stream.next().await {
+            match update {
+                Ok(update) => {
+                    self.handle_update(&api, &update).await;
+                }
+
+                Err(error) => {
+                    error!("Failed to fetch update: {:?}", error);
+                }
             }
         }
-    }
-    Ok(())
-}
-
-async fn handle_update(api: &Api, update: &Update) {
-    if let UpdateKind::Message(message) = &update.kind {
-        handle_message(api, message).await;
-    }
-}
-
-async fn handle_message(api: &Api, message: &Message) {
-    if let Err(e) = remember_message_sender(message).await {
-        error!("Failed to remember user {:?}: {:?}", message.from, e);
+        Ok(())
     }
 
-    if let Some(text) = &message.text() {
-        // Check for bot commands
-        if let MessageKind::Text { ref entities, .. } = message.kind {
-            if let Some(
-                command
-                @ MessageEntity {
-                    kind: BotCommand, ..
-                },
-            ) = entities.get(0)
-            {
-                if let Some(command_text) = text
-                    .get((command.offset + 1) as usize..(command.offset + command.length) as usize)
-                {
-                    if command_text == "msg" || command_text.starts_with("msg@") {
-                        let (source, mention_entity) = if let Some(entity) = entities.get(1) {
-                            if let Some(user_mention) = get_user_mention(text, entity) {
-                                (Source::SingleUser(user_mention), Some(entity))
-                            } else {
-                                (Source::AllUsers, None)
-                            }
-                        } else {
-                            (Source::AllUsers, None)
-                        };
-                        let reply_text = {
-                            let seed = match source {
-                                Source::SingleUser(_) => get_seed(text.get(
-                                    (mention_entity.unwrap().offset
-                                        + mention_entity.unwrap().length)
-                                        as usize..,
-                                )),
-                                Source::AllUsers => {
-                                    get_seed(text.get((command.offset + command.length) as usize..))
-                                }
-                            };
-                            match seed {
-                                Err(e) => e,
-                                Ok(seed) => {
-                                    debug!("Got /msg for {:?}", source);
-                                    match do_msg_command(&message.chat.id(), &source, seed).await {
-                                        Ok(Some(text)) => text,
-                                        Ok(None)
-                                        | Err(MsgCommandError::MarkovChainError(
-                                            MarkovChainError::Empty,
-                                        )) => "<no data>".to_owned(),
-                                        Err(MsgCommandError::MarkovChainError(
-                                            MarkovChainError::NoSuchSeed,
-                                        )) => "<no such seed>".to_owned(),
-                                        Err(e) => {
-                                            error!(
-                                                "An error occurred executing /msg command: {:?}",
-                                                e
-                                            );
-                                            "<an error occurred>".to_owned()
-                                        }
-                                    }
-                                }
-                            }
-                        };
-                        if let Err(e) = api.send(message.text_reply(reply_text)).await {
-                            error!("Failed to send reply: {:?}", e);
-                        }
+    async fn handle_update(&mut self, api: &Api, update: &Update) {
+        if let UpdateKind::Message(message) = &update.kind {
+            self.handle_message(api, message).await;
+        }
+    }
+
+    async fn handle_message(&mut self, api: &Api, message: &Message) {
+        if let Err(e) = remember_message_sender(message).await {
+            error!("Failed to remember user {:?}: {:?}", message.from, e);
+        }
+
+        if let Some(text) = &message.text() {
+            // Check if the message is a reply to a prompt
+            if let Some(prompt) = self.original_prompt_for(message) {
+                match prompt.handle_response(message).await {
+                    Err(e) => {
+                        error!("Failed to handle prompt response: {:?}", e);
+                    }
+                    Ok(reply_text) => {
+                        try_reply(api, message, reply_text).await;
                     }
                 }
-                return; // Don't add bot command messages to the Markov chain
+                return;
+            }
+
+            // Check for bot commands
+            if let MessageKind::Text { ref entities, .. } = message.kind {
+                if let Some(
+                    command
+                    @
+                    MessageEntity {
+                        kind: BotCommand, ..
+                    },
+                ) = entities.get(0)
+                {
+                    if let Some(command_text) = text.get(
+                        (command.offset + 1) as usize..(command.offset + command.length) as usize,
+                    ) {
+                        if command_text == "msg" || command_text.starts_with("msg@") {
+                            handle_msg_command_message(api, message, text, command, entities).await;
+                        } else if command_text == "deletemydata"
+                            || command_text.starts_with("deletemydata@")
+                        {
+                            self.handle_delete_my_data_command_message(api, message)
+                                .await;
+                        }
+                    }
+                    return; // Don't add bot command messages to the Markov chain
+                }
+            }
+
+            // If message was not handled by some bot command, add it to the sending user's markov chain
+            if let Err(e) = add_to_markov_chain(message).await {
+                error!("Failed to add message to Markov chain: {:?}", e);
+            };
+        }
+    }
+
+    async fn handle_delete_my_data_command_message(&mut self, api: &Api, message: &Message) {
+        let ask_message_id = match try_reply(
+            api,
+            message,
+            "Are you sure you want to delete your Markov chain data in this group?".to_owned(),
+        )
+        .await
+        {
+            None => {
+                return;
+            }
+            Some(result) => result.to_message_id(),
+        };
+
+        let chat_prompts = if self.prompts.contains_key(&message.chat.id()) {
+            self.prompts.get_mut(&message.chat.id()).unwrap()
+        } else {
+            self.prompts
+                .insert(message.chat.id().clone(), HashMap::new());
+            self.prompts.get_mut(&message.chat.id()).unwrap()
+        };
+
+        let prompt = Prompt {
+            message_id: ask_message_id,
+            data: PromptData::DeleteMyData,
+        };
+        chat_prompts.insert(message.from.id.clone(), prompt);
+    }
+
+    fn original_prompt_for(&self, message: &Message) -> Option<&Prompt> {
+        if let Some(reply_to_message) = &message.reply_to_message {
+            if let Some(prompts) = self.prompts.get(&message.chat.id()) {
+                if let Some(prompt) = prompts.get(&message.from.id) {
+                    if prompt.message_id == reply_to_message.to_message_id() {
+                        return Some(prompt);
+                    }
+                }
             }
         }
-
-        // If message was not handled by some bot command, add it to the sending user's markov chain
-        if let Err(e) = add_to_markov_chain(message).await {
-            error!("Failed to add message to Markov chain: {:?}", e);
-        };
+        None
     }
+}
+
+struct Prompt {
+    message_id: MessageId,
+    data: PromptData,
+}
+
+impl Prompt {
+    async fn handle_response(&self, response: &Message) -> Result<String, mongodb::error::Error> {
+        self.data.handle_response(response).await
+    }
+}
+
+enum PromptData {
+    DeleteMyData,
+}
+
+impl PromptData {
+    async fn handle_response(&self, response: &Message) -> Result<String, mongodb::error::Error> {
+        Ok(match self {
+            PromptData::DeleteMyData => {
+                if response.text().unwrap_or_default().to_lowercase() == "yes" {
+                    if let Some(mut chat_data) = read_chat_data(&response.chat.id()).await? {
+                        let user_id = response.from.id.to_string();
+                        if chat_data.data.contains_key(user_id.as_str()) {
+                            chat_data.data.remove(user_id.as_str());
+                            write_chat_data(chat_data).await?;
+                            Some(
+                                "Your Markov chain data in this group has been deleted.".to_owned(),
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                    .unwrap_or("No data found.".to_owned())
+                } else {
+                    "Okay, I won't delete your Markov chain data in this group then.".to_owned()
+                }
+            }
+        })
+    }
+}
+
+async fn handle_msg_command_message(
+    api: &Api,
+    message: &Message,
+    text: &String,
+    command: &MessageEntity,
+    entities: &Vec<MessageEntity>,
+) {
+    let (source, mention_entity) = match entities.get(1) {
+        Some(entity) => {
+            if let Some(user_mention) = get_user_mention(text, entity) {
+                (Source::SingleUser(user_mention), Some(entity))
+            } else {
+                (Source::AllUsers, None)
+            }
+        }
+        None => (Source::AllUsers, None),
+    };
+    let reply_text = {
+        let seed = match source {
+            Source::SingleUser(_) => {
+                get_seed(text.get(
+                    (mention_entity.unwrap().offset + mention_entity.unwrap().length) as usize..,
+                ))
+            }
+            Source::AllUsers => get_seed(text.get((command.offset + command.length) as usize..)),
+        };
+        match seed {
+            Err(e) => e,
+            Ok(seed) => {
+                debug!("Got /msg for {:?}", source);
+                match do_msg_command(&message.chat.id(), &source, seed).await {
+                    Ok(Some(text)) => text,
+                    Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
+                        "<no data>".to_owned()
+                    }
+                    Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
+                        "<no such seed>".to_owned()
+                    }
+                    Err(e) => {
+                        error!("An error occurred executing /msg command: {:?}", e);
+                        "<an error occurred>".to_owned()
+                    }
+                }
+            }
+        }
+    };
+    try_reply(api, message, reply_text).await;
 }
 
 /// Parses up to one seed value from the given optional string. Err is returned if more than one seed value is given.
@@ -234,15 +356,10 @@ async fn add_to_markov_chain(message: &Message) -> Result<(), mongodb::error::Er
             let chat_id = message.chat.id();
             let chat_id_raw: Integer = chat_id.into();
             let chat_id_str = chat_id_raw.to_string();
-            let mut chat_data = read_chat_data(&chat_id)
-                .await?
-                .or_else(|| {
-                    Some(ChatData {
-                        chat_id: chat_id_str,
-                        data: HashMap::new(),
-                    })
-                })
-                .unwrap();
+            let mut chat_data = read_chat_data(&chat_id).await?.unwrap_or_else(|| ChatData {
+                chat_id: chat_id_str,
+                data: HashMap::new(),
+            });
             let sender_id_raw: Integer = message.from.id.into();
             let sender_id_str = sender_id_raw.to_string();
             chat_data.add_message(&sender_id_str, text); // Add to the specific user's Markov chain
@@ -259,11 +376,19 @@ async fn read_chat_data(chat_id: &ChatId) -> Result<Option<ChatData>, mongodb::e
     let chat_id_str = chat_id_raw.to_string();
     let db = connect_to_db().await?;
     let collection = db.collection_with_type::<ChatData>(CHATS_COLLECTION_NAME);
-    let chat_data = collection
-        .find_one(doc! {CHAT_ID_KEY: chat_id_str}, None)
-        .await?;
-    debug!("Read chat data {:?}", chat_data);
-    Ok(chat_data)
+    let result = collection
+        .find_one(doc! {CHAT_ID_KEY: chat_id_str.clone()}, None)
+        .await;
+    match result {
+        Ok(chat_data) => {
+            debug!("Read chat data for chat {}: {:?}", chat_id_str, chat_data);
+            Ok(chat_data)
+        }
+        Err(e) => {
+            error!("Failed to read chat data for chat {}: {:?}", chat_id_str, e);
+            Err(e)
+        }
+    }
 }
 
 async fn write_chat_data(chat_data: ChatData) -> Result<(), mongodb::error::Error> {
@@ -274,16 +399,24 @@ async fn write_chat_data(chat_data: ChatData) -> Result<(), mongodb::error::Erro
         replace_options.upsert = Some(true); // Insert new document if an existing one isn't found
         replace_options
     };
-    let msg = format!("Wrote chat data {:?}", chat_data.chat_id);
-    collection
+    let chat_id = chat_data.chat_id.clone();
+    let result = collection
         .replace_one(
             doc! {CHAT_ID_KEY: chat_data.chat_id.clone()},
             chat_data,
             Some(replace_options),
         )
-        .await?;
-    debug!("{}", msg);
-    Ok(())
+        .await;
+    match result {
+        Ok(_) => {
+            debug!("{}", format!("Wrote chat data for chat {}", chat_id));
+            Ok(())
+        }
+        Err(e) => {
+            error!("Failed to write chat data for chat {}: {:?}", chat_id, e);
+            Err(e)
+        }
+    }
 }
 
 async fn connect_to_db() -> Result<Database, mongodb::error::Error> {
@@ -307,6 +440,16 @@ fn get_user_mention<'a>(text: &String, entity: &'a MessageEntity) -> Option<User
         TextMention(user) => Some(UserMention::TextMention(user)),
 
         _ => None,
+    }
+}
+
+async fn try_reply(api: &Api, message: &Message, text: String) -> Option<MessageOrChannelPost> {
+    match api.send(message.text_reply(text)).await {
+        Err(e) => {
+            error!("Failed to send reply: {:?}", e);
+            None
+        }
+        Ok(result) => Some(result),
     }
 }
 

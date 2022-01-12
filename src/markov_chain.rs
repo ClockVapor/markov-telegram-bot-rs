@@ -41,7 +41,7 @@ impl MarkovChain {
         };
 
         let mut result: Vec<String> = vec![];
-        while word != "" {
+        while !word.is_empty() {
             result.push(word.clone());
             match self.data.get(&word) {
                 None => {
@@ -61,10 +61,10 @@ impl MarkovChain {
         Ok(result)
     }
 
-    /// Adds each word pair in the given String (separated by whitespace) to the Markov chain.
-    pub fn add_message(&mut self, text: &String) {
+    /// Adds each word pair in the given &str (separated by whitespace) to the Markov chain.
+    pub fn add_message(&mut self, text: &str) {
         let mut words = text.split_whitespace().peekable();
-        if let Some(_) = words.peek() {
+        if words.peek().is_some() {
             let mut last_word = "";
             for word in words {
                 self.add_word_pair(&last_word.to_owned(), &word.to_owned());
@@ -75,21 +75,21 @@ impl MarkovChain {
     }
 
     /// Adds a pair of words to the Markov chain.
-    fn add_word_pair(&mut self, first: &String, second: &String) {
+    fn add_word_pair(&mut self, first: &str, second: &str) {
         match self.data.get_mut(first) {
             Some(word_map) => match word_map.get(second) {
                 Some(count) => {
                     let new_count = count + 1;
-                    word_map.insert(second.clone(), new_count);
+                    word_map.insert(second.to_string(), new_count);
                 }
                 None => {
-                    word_map.insert(second.clone(), 1);
+                    word_map.insert(second.to_string(), 1);
                 }
             },
             None => {
                 let mut word_map = HashMap::new();
-                word_map.insert(second.clone(), 1);
-                self.data.insert(first.clone(), word_map);
+                word_map.insert(second.to_string(), 1);
+                self.data.insert(first.to_string(), word_map);
             }
         }
     }

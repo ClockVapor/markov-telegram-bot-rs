@@ -8,6 +8,8 @@ mod markov_telegram_bot;
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    env_logger::init();
+
     let args = App::new("markov-telegram-bot-rs")
         .arg(
             Arg::with_name("TELEGRAM_BOT_TOKEN")

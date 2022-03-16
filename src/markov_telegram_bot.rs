@@ -1,79 +1,95 @@
 use std::cmp::Ordering;
-use std::collections::hash_map::Entry::Vacant;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 
-use futures::StreamExt;
-use log::{debug, error};
+use frankenstein::MessageEntityType::TextMention;
+use frankenstein::{
+    AsyncApi, AsyncTelegramApi, ChatId, ChatMember, GetChatAdministratorsParamsBuilder,
+    GetUpdatesParamsBuilder, Message, MessageEntity, MessageEntityType, SendMessageParamsBuilder,
+    User,
+};
+use log::{debug, error, info};
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ReplaceOptions};
-use mongodb::{Client, Database};
+use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
-use telegram_bot::{
-    Api, CanReplySendMessage, ChatId, Integer, Message, MessageEntity, MessageEntityKind,
-    MessageId, MessageKind, MessageOrChannelPost, MessageText, ToMessageId, Update, UpdateKind,
-    User, UserId,
-};
-use MessageEntityKind::{BotCommand, Mention, TextMention};
+use MessageEntityType::Mention;
 
 use crate::{MarkovChain, MarkovChainError};
 
 /// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &str = "all";
 
+/// MongoDB collection name for chat data.
 const CHATS_COLLECTION_NAME: &str = "chats";
+/// Key for chat ID within the "chats" collection.
 const CHAT_ID_KEY: &str = "chat_id";
 
+/// MongoDB collection name for user info.
 const USER_INFOS_COLLECTION_NAME: &str = "user_infos";
+/// Key for username within the "user_infos" collection.
 const USERNAME_KEY: &str = "username";
-
-static YES_STRINGS: [&str; 5] = ["y", "yes", "ye", "ya", "yeah"];
 
 type DbError = mongodb::error::Error;
 
+/// Affirmative responses to questions asked by the bot.
+static YES_STRINGS: [&str; 7] = ["y", "yes", "ye", "ya", "yeah", "yea", "yah"];
+
 #[derive(Default)]
 pub struct MarkovTelegramBot {
-    prompts: HashMap<ChatId, HashMap<UserId, Prompt>>,
+    /// Map of prompts that the bot is asking users. First key is chat ID, second key is user ID within that chat.
+    prompts: HashMap<i64, HashMap<u64, Prompt>>,
 }
 
 impl MarkovTelegramBot {
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
 
     pub async fn run(&mut self, bot_token: &str) -> Result<(), String> {
-        let api = Api::new(bot_token);
-        let mut stream = api.stream();
-        while let Some(update) = stream.next().await {
-            match update {
-                Ok(update) => {
-                    self.handle_update(&api, &update).await;
-                }
+        let api = AsyncApi::new(bot_token);
+        let mut update_params_builder = GetUpdatesParamsBuilder::default();
+        update_params_builder.allowed_updates(vec!["message".to_string()]);
+        let mut update_params = update_params_builder.build().unwrap();
 
-                Err(error) => {
-                    error!("Failed to fetch update: {:?}", error);
+        info!("Bot started");
+        loop {
+            match api.get_updates(&update_params).await {
+                Ok(response) => {
+                    for update in response.result {
+                        if let Some(message) = update.message {
+                            self.handle_message(&api, &message).await;
+                            update_params = update_params_builder
+                                .offset(update.update_id + 1)
+                                .build()
+                                .unwrap();
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("Failed to get updates: {:?}", e);
                 }
             }
         }
-        Ok(())
     }
 
-    async fn handle_update(&mut self, api: &Api, update: &Update) {
-        if let UpdateKind::Message(message) = &update.kind {
-            self.handle_message(api, message).await;
-        }
-    }
-
-    async fn handle_message(&mut self, api: &Api, message: &Message) {
-        if let Err(e) = remember_message_sender(message).await {
-            error!("Failed to remember user {:?}: {:?}", message.from, e);
+    async fn handle_message(&mut self, api: &AsyncApi, message: &Message) {
+        if message.from.is_none() {
+            return;
         }
 
-        if let Some(text) = &message.text() {
+        // Don't care if this doesn't work here
+        match remember_message_sender(message).await {
+            _ => {}
+        };
+
+        if let Some(text) = &message.text {
             // Check if the message is a reply to a prompt
             if let Some(prompt) = self.original_prompt_for(message) {
                 match prompt.handle_response(message).await {
                     Err(e) => {
                         error!("Failed to handle prompt response: {:?}", e);
+                        try_reply(api, message, "<an error occurred>".to_string()).await;
                     }
                     Ok(reply_text) => {
                         try_reply(api, message, reply_text).await;
@@ -83,10 +99,11 @@ impl MarkovTelegramBot {
             }
 
             // Check for bot commands
-            if let MessageKind::Text { ref entities, .. } = message.kind {
+            if let Some(entities) = &message.entities {
                 if let Some(
                     command @ MessageEntity {
-                        kind: BotCommand, ..
+                        type_field: MessageEntityType::BotCommand,
+                        ..
                     },
                 ) = entities.get(0)
                 {
@@ -107,13 +124,23 @@ impl MarkovTelegramBot {
                         {
                             self.handle_delete_my_data_command_message(api, message)
                                 .await;
+                        } else if command_text == "deleteusermydata"
+                            || command_text.starts_with("deleteuserdata@")
+                        {
+                            self.handle_delete_user_data_command_message(
+                                api,
+                                message,
+                                text,
+                                entities.as_slice(),
+                            )
+                            .await;
                         }
                     }
                     return; // Don't add bot command messages to the Markov chain
                 }
             }
 
-            // If message was not handled by some bot command, add it to the sending user's markov chain
+            // If message was not handled by some bot command, add it to the sending user's Markov chain
             if let Err(e) = add_to_markov_chain(message).await {
                 error!("Failed to add message to Markov chain: {:?}", e);
             };
@@ -121,7 +148,7 @@ impl MarkovTelegramBot {
     }
 
     /// Handles a message with a /deletemydata command.
-    async fn handle_delete_my_data_command_message(&mut self, api: &Api, message: &Message) {
+    async fn handle_delete_my_data_command_message(&mut self, api: &AsyncApi, message: &Message) {
         let ask_message_id = match try_reply(
             api,
             message,
@@ -132,30 +159,100 @@ impl MarkovTelegramBot {
             None => {
                 return;
             }
-            Some(result) => result.to_message_id(),
+            Some(result) => result.message_id,
         };
 
-        let chat_prompts = if let Vacant(e) = self.prompts.entry(message.chat.id()) {
-            e.insert(HashMap::new());
-            self.prompts.get_mut(&message.chat.id()).unwrap()
-        } else {
-            self.prompts.get_mut(&message.chat.id()).unwrap()
-        };
+        let chat_prompts = self.get_chat_prompts(message);
 
         let prompt = Prompt {
             message_id: ask_message_id,
             kind: PromptKind::DeleteMyData,
         };
-        chat_prompts.insert(message.from.id, prompt);
+        chat_prompts.insert(message.from.as_ref().unwrap().id, prompt);
+    }
+
+    /// Handles a message with a /deleteuserdata command.
+    async fn handle_delete_user_data_command_message(
+        &mut self,
+        api: &AsyncApi,
+        message: &Message,
+        text: &str,
+        entities: &[MessageEntity],
+    ) {
+        let params = GetChatAdministratorsParamsBuilder::default()
+            .chat_id(ChatId::Integer(message.chat.id))
+            .build()
+            .unwrap();
+        let admins = api.get_chat_administrators(&params).await;
+        match admins {
+            Err(e) => {
+                error!("Failed to fetch chat admins: {:?}", e);
+                try_reply(api, message, "<an error occurred>".to_string()).await;
+            }
+            Ok(admins) => {
+                if !admins.result.iter().any(|chat_member| match chat_member {
+                    ChatMember::Owner(m) => m.user.id == message.from.as_ref().unwrap().id,
+                    ChatMember::Administrator(m) => m.user.id == message.from.as_ref().unwrap().id,
+                    _ => false,
+                })
+                //.any(|a| a.id.to_string() == message.from.unwrap().id.to_string())
+                {
+                    try_reply(api, message, "You aren't an admin.".to_string()).await;
+                    return;
+                }
+                let user_id = match entities.get(1) {
+                    Some(entity) => match get_user_mention(text, entity) {
+                        Some(user_mention) => user_mention.user_id().await,
+                        None => Ok(None),
+                    },
+                    None => Ok(None),
+                };
+                match user_id {
+                    Err(_) => {
+                        try_reply(api, message, "<an error occurred>".to_string()).await;
+                    }
+                    Ok(None) => {
+                        try_reply(api, message, "<expected a user mention>".to_string()).await;
+                    }
+                    Ok(Some(user_id)) => {
+                        let ask_message_id = match try_reply(api, message,
+                                                             "Are you sure you want to delete that user's Markov chain data in this group?".to_string()).await {
+                            None => {
+                                try_reply(api, message, "<an error occurred>".to_string()).await;
+                                return;
+                            }
+                            Some(result) => result.message_id,
+                        };
+                        let prompt = Prompt {
+                            message_id: ask_message_id,
+                            kind: PromptKind::DeleteUserData(user_id),
+                        };
+                        self.get_chat_prompts(message)
+                            .insert(message.from.as_ref().unwrap().id, prompt);
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_chat_prompts(&mut self, message: &Message) -> &mut HashMap<u64, Prompt> {
+        if let Vacant(e) = self.prompts.entry(message.chat.id) {
+            e.insert(HashMap::new());
+            self.prompts.get_mut(&message.chat.id).unwrap()
+        } else {
+            self.prompts.get_mut(&message.chat.id).unwrap()
+        }
     }
 
     /// Gets the prompt that a message is replying to, if one exists.
     fn original_prompt_for(&self, message: &Message) -> Option<&Prompt> {
         if let Some(reply_to_message) = &message.reply_to_message {
-            if let Some(prompts) = self.prompts.get(&message.chat.id()) {
-                if let Some(prompt) = prompts.get(&message.from.id) {
-                    if prompt.message_id == reply_to_message.to_message_id() {
-                        return Some(prompt);
+            if let Some(prompts) = self.prompts.get(&message.chat.id) {
+                if let Some(user) = &message.from {
+                    if let Some(prompt) = prompts.get(&user.id) {
+                        if prompt.message_id == reply_to_message.message_id {
+                            return Some(prompt);
+                        }
                     }
                 }
             }
@@ -166,7 +263,7 @@ impl MarkovTelegramBot {
 
 struct Prompt {
     /// Message ID for the message from the bot that initiated this prompt.
-    message_id: MessageId,
+    message_id: i32,
     kind: PromptKind,
 }
 
@@ -178,26 +275,33 @@ impl Prompt {
 
 enum PromptKind {
     DeleteMyData,
+    DeleteUserData(String),
 }
 
 impl PromptKind {
     async fn handle_response(&self, response: &Message) -> Result<String, DbError> {
         Ok(match self {
             PromptKind::DeleteMyData => {
-                if YES_STRINGS
-                    .contains(&response.text().unwrap_or_default().to_lowercase().as_str())
-                {
-                    if let Some(mut chat_data) = read_chat_data(&response.chat.id()).await? {
-                        let user_id = response.from.id.to_string();
-                        if chat_data.data.contains_key(user_id.as_str()) {
-                            chat_data.data.remove(user_id.as_str());
-                            write_chat_data(chat_data).await?;
-                            Some(
-                                "Your Markov chain data in this group has been deleted."
-                                    .to_string(),
-                            )
-                        } else {
-                            None
+                if YES_STRINGS.contains(
+                    &response
+                        .text
+                        .as_ref()
+                        .unwrap_or(&"".to_string())
+                        .to_lowercase()
+                        .as_str(),
+                ) {
+                    if let Some(mut chat_data) = read_chat_data(&response.chat.id).await? {
+                        let user_id = response.from.as_ref().unwrap().id.to_string();
+                        match chat_data.data.entry(user_id) {
+                            Occupied(entry) => {
+                                entry.remove();
+                                write_chat_data(chat_data).await?;
+                                Some(
+                                    "Your Markov chain data in this group has been deleted."
+                                        .to_string(),
+                                )
+                            }
+                            Vacant(_) => None,
                         }
                     } else {
                         None
@@ -207,12 +311,42 @@ impl PromptKind {
                     "Okay, I won't delete your Markov chain data in this group then.".to_string()
                 }
             }
+
+            PromptKind::DeleteUserData(user_id) => {
+                if YES_STRINGS.contains(
+                    &response
+                        .text
+                        .as_ref()
+                        .unwrap_or(&"".to_string())
+                        .to_lowercase()
+                        .as_str(),
+                ) {
+                    if let Some(mut chat_data) = read_chat_data(&response.chat.id).await? {
+                        match chat_data.data.entry(user_id.to_string()) {
+                            Occupied(entry) => {
+                                entry.remove();
+                                write_chat_data(chat_data).await?;
+                                Some(
+                                    "Their Markov chain data in this group has been deleted."
+                                        .to_string(),
+                                )
+                            }
+                            Vacant(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                    .unwrap_or_else(|| "No data found.".to_string())
+                } else {
+                    "Okay, I won't delete their Markov chain data in this group then.".to_string()
+                }
+            }
         })
     }
 }
 
 async fn handle_msg_command_message(
-    api: &Api,
+    api: &AsyncApi,
     message: &Message,
     text: &str,
     command: &MessageEntity,
@@ -241,7 +375,7 @@ async fn handle_msg_command_message(
             Err(e) => e,
             Ok(seed) => {
                 debug!("Got /msg for {:?}", source);
-                match do_msg_command(&message.chat.id(), &source, seed).await {
+                match do_msg_command(&message.chat.id, &source, seed).await {
                     Ok(Some(text)) => text,
                     Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
                         "<no data>".to_string()
@@ -277,36 +411,44 @@ fn get_seed(text: Option<&str>) -> Result<Option<String>, String> {
 
 /// Stores the message sender's username and user ID so that their username can be associated with their user ID.
 async fn remember_message_sender(message: &Message) -> Result<(), DbError> {
-    if let Some(username) = &message.from.username {
+    if let Some(username) = &message.from.as_ref().unwrap().username {
         let username = username.to_lowercase();
         let db = connect_to_db().await?;
-        let user_infos = db.collection_with_type::<UserInfo>(USER_INFOS_COLLECTION_NAME);
+        let user_infos: Collection<UserInfo> = db.collection(USER_INFOS_COLLECTION_NAME);
         let replace_options = {
             let mut replace_options = ReplaceOptions::default();
             replace_options.upsert = Some(true); // Insert new document if an existing one isn't found
             replace_options
         };
-        user_infos
+        let result = user_infos
             .replace_one(
                 doc! {USERNAME_KEY: &username},
                 UserInfo {
                     username: username.clone(),
-                    user_id: message.from.id.to_string(),
+                    user_id: message.from.as_ref().unwrap().id.to_string(),
                 },
                 replace_options,
             )
-            .await?;
+            .await;
+        if let Err(e) = result {
+            error!(
+                "Failed to remember username {} has user_id {}",
+                &username,
+                message.from.as_ref().unwrap().id
+            );
+            return Err(e);
+        }
         debug!(
             "Remembered username {} has user_id {}",
             &username,
-            message.from.id.to_string()
+            message.from.as_ref().unwrap().id
         );
     }
     Ok(())
 }
 
 async fn do_msg_command<'a>(
-    chat_id: &ChatId,
+    chat_id: &i64,
     source: &Source<'a>,
     seed: Option<String>,
 ) -> Result<Option<String>, MsgCommandError> {
@@ -320,7 +462,7 @@ async fn do_msg_command<'a>(
         Ok(Some(user_id)) => match read_chat_data(chat_id).await {
             Err(e) => Err(MsgCommandError::DbError(e)),
             Ok(None) => Ok(None),
-            Ok(Some(chat_data)) => match chat_data.data.get(&user_id) {
+            Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
                 Some(markov_chain) => match markov_chain.generate(seed) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
@@ -331,31 +473,34 @@ async fn do_msg_command<'a>(
     }
 }
 
-#[derive(Debug)]
-enum MsgCommandError {
-    MarkovChainError(MarkovChainError),
-    DbError(DbError),
+async fn try_reply(api: &AsyncApi, reply_to_message: &Message, text: String) -> Option<Message> {
+    let params = SendMessageParamsBuilder::default()
+        .chat_id(ChatId::Integer(reply_to_message.chat.id))
+        .reply_to_message_id(reply_to_message.message_id)
+        .text(text)
+        .build()
+        .unwrap();
+    match api.send_message(&params).await {
+        Err(e) => {
+            error!("Failed to send reply: {:?}", e);
+            None
+        }
+        Ok(result) => Some(result.result),
+    }
 }
 
 async fn add_to_markov_chain(message: &Message) -> Result<(), DbError> {
-    let text = match &message.kind {
-        MessageKind::Text { data, .. } => Some(data),
-        MessageKind::Photo { caption, .. } => caption.as_ref(),
-        MessageKind::Video { caption, .. } => caption.as_ref(),
-        MessageKind::Document { caption, .. } => caption.as_ref(),
-        _ => None,
-    };
+    let text = message.text.as_ref().or(message.caption.as_ref());
     match text {
         Some(text) => {
-            let chat_id = message.chat.id();
-            let chat_id_raw: Integer = chat_id.into();
-            let chat_id_str = chat_id_raw.to_string();
-            let mut chat_data = read_chat_data(&chat_id).await?.unwrap_or_else(|| ChatData {
-                chat_id: chat_id_str,
-                data: HashMap::new(),
-            });
-            let sender_id_raw: Integer = message.from.id.into();
-            let sender_id_str = sender_id_raw.to_string();
+            let mut chat_data =
+                read_chat_data(&message.chat.id)
+                    .await?
+                    .unwrap_or_else(|| ChatData {
+                        chat_id: message.chat.id,
+                        data: HashMap::new(),
+                    });
+            let sender_id_str = message.from.as_ref().unwrap().id.to_string();
             chat_data.add_message(&sender_id_str, text); // Add to the specific user's Markov chain
             chat_data.add_message(&ALL.to_string(), text); // Also add to the "all users" Markov chain
             write_chat_data(chat_data).await
@@ -365,21 +510,19 @@ async fn add_to_markov_chain(message: &Message) -> Result<(), DbError> {
     }
 }
 
-async fn read_chat_data(chat_id: &ChatId) -> Result<Option<ChatData>, DbError> {
-    let chat_id_raw: Integer = (*chat_id).into();
-    let chat_id_str = chat_id_raw.to_string();
+async fn read_chat_data(chat_id: &i64) -> Result<Option<ChatData>, DbError> {
     let db = connect_to_db().await?;
-    let collection = db.collection_with_type::<ChatData>(CHATS_COLLECTION_NAME);
+    let collection = db.collection(CHATS_COLLECTION_NAME);
     let result = collection
-        .find_one(doc! {CHAT_ID_KEY: chat_id_str.clone()}, None)
+        .find_one(doc! {CHAT_ID_KEY: chat_id.clone()}, None)
         .await;
     match result {
         Ok(chat_data) => {
-            debug!("Read chat data for chat {}: {:?}", chat_id_str, chat_data);
+            debug!("Read chat data for chat {}: {:?}", chat_id, chat_data);
             Ok(chat_data)
         }
         Err(e) => {
-            error!("Failed to read chat data for chat {}: {:?}", chat_id_str, e);
+            error!("Failed to read chat data for chat {}: {:?}", chat_id, e);
             Err(e)
         }
     }
@@ -387,7 +530,7 @@ async fn read_chat_data(chat_id: &ChatId) -> Result<Option<ChatData>, DbError> {
 
 async fn write_chat_data(chat_data: ChatData) -> Result<(), DbError> {
     let db = connect_to_db().await?;
-    let collection = db.collection_with_type::<ChatData>(CHATS_COLLECTION_NAME);
+    let collection: Collection<ChatData> = db.collection(CHATS_COLLECTION_NAME);
     let replace_options = {
         let mut replace_options = ReplaceOptions::default();
         replace_options.upsert = Some(true); // Insert new document if an existing one isn't found
@@ -415,15 +558,27 @@ async fn write_chat_data(chat_data: ChatData) -> Result<(), DbError> {
 
 async fn connect_to_db() -> Result<Database, DbError> {
     let mut client_options =
-        ClientOptions::parse("mongodb://localhost:27017/?connectTimeoutMS=3000").await?;
+        match ClientOptions::parse("mongodb://localhost:27017/?connectTimeoutMS=3000").await {
+            Ok(client_options) => client_options,
+            Err(e) => {
+                error!("Failed to connect to database: {:?}", e);
+                return Err(e);
+            }
+        };
     client_options.app_name = Some("markov-telegram-bot-rs".to_string());
-    let client = Client::with_options(client_options)?;
+    let client = match Client::with_options(client_options) {
+        Ok(client) => client,
+        Err(e) => {
+            error!("Failed to build database client: {:?}", e);
+            return Err(e);
+        }
+    };
     Ok(client.database("markov"))
 }
 
 /// Given a message's text and a `MessageEntity` within it, returns a `UserMention` if one is present.
 fn get_user_mention<'a>(text: &str, entity: &'a MessageEntity) -> Option<UserMention<'a>> {
-    match &entity.kind {
+    match &entity.type_field {
         Mention => {
             let username = text
                 .get((entity.offset + 1) as usize..(entity.offset + entity.length) as usize)?
@@ -431,26 +586,16 @@ fn get_user_mention<'a>(text: &str, entity: &'a MessageEntity) -> Option<UserMen
             Some(UserMention::AtMention(username))
         }
 
-        TextMention(user) => Some(UserMention::TextMention(user)),
+        TextMention => Some(UserMention::TextMention(&entity.user.as_ref().unwrap())),
 
         _ => None,
-    }
-}
-
-async fn try_reply(api: &Api, message: &Message, text: String) -> Option<MessageOrChannelPost> {
-    match api.send(message.text_reply(text)).await {
-        Err(e) => {
-            error!("Failed to send reply: {:?}", e);
-            None
-        }
-        Ok(result) => Some(result),
     }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatData {
     /// ID of the Telegram chat that this data belongs to.
-    chat_id: String,
+    chat_id: i64,
 
     /// HashMap from a Telegram user's ID to their Markov chain.
     data: HashMap<String, MarkovChain>,
@@ -504,14 +649,31 @@ impl<'a> UserMention<'a> {
             UserMention::AtMention(username) => {
                 let username = username.to_lowercase();
                 let db = connect_to_db().await?;
-                let user_infos = db.collection_with_type::<UserInfo>(USER_INFOS_COLLECTION_NAME);
-                let user_info = user_infos
+                let user_infos: Collection<UserInfo> = db.collection(USER_INFOS_COLLECTION_NAME);
+                let user_info = match user_infos
                     .find_one(doc! {USERNAME_KEY: &username}, None)
-                    .await?;
+                    .await
+                {
+                    Ok(user_info) => user_info,
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch user ID for username \"{}\": {:?}",
+                            username, e
+                        );
+                        return Err(e);
+                    }
+                };
                 debug!("Read user info for username {}: {:?}", &username, user_info);
                 Ok(user_info.map(|o| o.user_id))
             }
+
             UserMention::TextMention(user) => Ok(Some(user.id.to_string())),
         }
     }
+}
+
+#[derive(Debug)]
+enum MsgCommandError {
+    DbError(DbError),
+    MarkovChainError(MarkovChainError),
 }

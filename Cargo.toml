@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-log = "0.4.14"
+log = { version = "0.4.14", features = ["max_level_trace"] }
+env_logger = "0.9.0"
 clap = "2.33.3"
-telegram-bot = "0.8"
-futures = "0.3.15"
-tokio = { version = "0.2", features = ["full"]}
-mongodb = "1.2.1"
+frankenstein = { version = "0.10.0", default_features = false, features = ["async-http-client"] }
+futures = "0.3.5"
+tokio = { version = "1.16.0", features = ["full"] }
+mongodb = "2.1.0"
 serde = "1.0.126"
 rand = "0.8.4"

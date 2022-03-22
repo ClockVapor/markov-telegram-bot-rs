@@ -194,9 +194,7 @@ impl MarkovTelegramBot {
                     ChatMember::Owner(m) => m.user.id == message.from.as_ref().unwrap().id,
                     ChatMember::Administrator(m) => m.user.id == message.from.as_ref().unwrap().id,
                     _ => false,
-                })
-                //.any(|a| a.id.to_string() == message.from.unwrap().id.to_string())
-                {
+                }) {
                     try_reply(api, message, "You aren't an admin.".to_string()).await;
                     return;
                 }
@@ -292,6 +290,16 @@ impl PromptKind {
                 ) {
                     if let Some(mut chat_data) = read_chat_data(&response.chat.id).await? {
                         let user_id = response.from.as_ref().unwrap().id.to_string();
+
+                        // Remove the user's Markov chain from the "all" Markov chain
+                        if chat_data.data.contains_key(&user_id) {
+                            let markov_chain_clone = chat_data.data.get(&user_id).unwrap().clone();
+                            if let Some(all_markov_chain) = chat_data.data.get_mut(ALL) {
+                                all_markov_chain.remove_markov_chain(&markov_chain_clone);
+                            }
+                        }
+
+                        // Delete the user's Markov chain
                         match chat_data.data.entry(user_id) {
                             Occupied(entry) => {
                                 entry.remove();
@@ -322,6 +330,15 @@ impl PromptKind {
                         .as_str(),
                 ) {
                     if let Some(mut chat_data) = read_chat_data(&response.chat.id).await? {
+                        // Remove the user's Markov chain from the "all" Markov chain
+                        if chat_data.data.contains_key(user_id) {
+                            let markov_chain_clone = chat_data.data.get(user_id).unwrap().clone();
+                            if let Some(all_markov_chain) = chat_data.data.get_mut(ALL) {
+                                all_markov_chain.remove_markov_chain(&markov_chain_clone);
+                            }
+                        }
+
+                        // Delete the user's Markov chain
                         match chat_data.data.entry(user_id.to_string()) {
                             Occupied(entry) => {
                                 entry.remove();

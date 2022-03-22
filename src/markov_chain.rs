@@ -9,7 +9,7 @@ use MarkovChainError::*;
 pub type Counter = i64;
 
 /// Data structure holding a Markov chain and the ID of the Telegram user it belongs to.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MarkovChain {
     /// ID of user who owns this markov chain.
     pub user_id: String,
@@ -45,7 +45,7 @@ impl MarkovChain {
             result.push(word.clone());
             match self.data.get(&word) {
                 None => {
-                    // Should never happen based on how we build the markov chains
+                    // Should never happen based on how we build the Markov chains
                     error!(
                         "Expected word {} to be in the Markov chain but it wasn't",
                         word
@@ -74,7 +74,16 @@ impl MarkovChain {
         }
     }
 
-    /// Adds a pair of words to the Markov chain.
+    /// Removes a Markov chain's word pair counts from this Markov chain.
+    pub fn remove_markov_chain(&mut self, other: &MarkovChain) {
+        for (first, word_map) in other.data.iter() {
+            for (second, counter) in word_map.iter() {
+                self.remove_word_pair(first, second, counter);
+            }
+        }
+    }
+
+    /// Adds a single count to a pair of words in the Markov chain.
     fn add_word_pair(&mut self, first: &str, second: &str) {
         match self.data.get_mut(first) {
             Some(word_map) => match word_map.get(second) {
@@ -90,6 +99,23 @@ impl MarkovChain {
                 let mut word_map = HashMap::new();
                 word_map.insert(second.to_string(), 1);
                 self.data.insert(first.to_string(), word_map);
+            }
+        }
+    }
+
+    /// Removes a given count from a pair of words in the Markov chain.
+    fn remove_word_pair(&mut self, first: &str, second: &str, amount: &Counter) {
+        if let Some(word_map) = self.data.get_mut(first) {
+            if let Some(count) = word_map.get(second) {
+                let new_count = count - amount;
+                if new_count > 0 {
+                    word_map.insert(second.to_string(), new_count);
+                } else {
+                    word_map.remove(second);
+                    if word_map.is_empty() {
+                        self.data.remove(first);
+                    }
+                }
             }
         }
     }

@@ -19,8 +19,17 @@ async fn main() -> Result<(), String> {
                 .required(true)
                 .takes_value(true),
         )
+        .arg(
+            Arg::with_name("MONGODB_URL")
+                .short("d")
+                .long("database")
+                .help("URL for the MongoDB database")
+                .required(true)
+                .takes_value(true),
+        )
         .get_matches();
 
-    let bot_token = args.value_of("TELEGRAM_BOT_TOKEN").unwrap();
-    MarkovTelegramBot::new().run(bot_token).await
+    let bot_token = args.value_of("TELEGRAM_BOT_TOKEN").unwrap().to_string();
+    let db_url = args.value_of("MONGODB_URL").unwrap().to_string();
+    MarkovTelegramBot::new(bot_token, db_url).run().await
 }

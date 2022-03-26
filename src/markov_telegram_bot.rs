@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -6,8 +7,8 @@ use std::sync::Mutex;
 use frankenstein::MessageEntityType::TextMention;
 use frankenstein::{
     AsyncApi, AsyncTelegramApi, ChatId, ChatMember, GetChatAdministratorsParamsBuilder,
-    GetUpdatesParamsBuilder, Message, MessageEntity, MessageEntityType, SendMessageParamsBuilder,
-    User,
+    GetChatMemberParams, GetUpdatesParamsBuilder, Message, MessageEntity, MessageEntityType,
+    SendMessageParamsBuilder, User,
 };
 use lazy_static::lazy_static;
 use log::{debug, error, info};
@@ -17,7 +18,8 @@ use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
 use MessageEntityType::Mention;
 
-use crate::{MarkovChainError, TripletMarkovChain};
+use crate::import::{MessageContents, TextPiece};
+use crate::{import, read_chat_export, MarkovChainError, TripletMarkovChain};
 
 /// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &str = "all";
@@ -42,8 +44,20 @@ lazy_static! {
     static ref PROMPTS: Mutex<HashMap<i64, HashMap<u64, Prompt>>> = Mutex::new(HashMap::new());
 }
 
-pub async fn run(bot_token: String, db_url: String) -> Result<(), String> {
+pub async fn run(
+    bot_token: String,
+    db_url: String,
+    import_file_path: Option<&str>,
+) -> Result<(), String> {
     let api = AsyncApi::new(bot_token.as_str());
+
+    if let Some(file_path) = import_file_path {
+        if let Err(e) = import_chat(&api, &db_url, file_path).await {
+            error!("Failed to import: {:?}", e);
+            return Err("Failed to import".to_string());
+        }
+    }
+
     let mut update_params_builder = GetUpdatesParamsBuilder::default();
     update_params_builder.allowed_updates(vec!["message".to_string()]);
     let mut update_params = update_params_builder.build().unwrap();
@@ -117,7 +131,6 @@ async fn handle_message(api: AsyncApi, db_url: &str, message: Message) {
                             &api,
                             &message,
                             text,
-                            command,
                             entities.as_slice(),
                         )
                         .await;
@@ -373,7 +386,6 @@ async fn handle_msg_command_message(
     api: &AsyncApi,
     message: &Message,
     text: &str,
-    _command: &MessageEntity,
     entities: &[MessageEntity],
 ) {
     let (source, _mention_entity) = match entities.get(1) {
@@ -387,7 +399,7 @@ async fn handle_msg_command_message(
         None => (Source::AllUsers, None),
     };
     let reply_text = {
-        debug!("Got /msg for {:?}", source);
+        debug!("Got /msg for {:?} in chat {}", source, message.chat.id);
         match do_msg_command(db_url, &message.chat.id, &source).await {
             Ok(Some(text)) => text,
             Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
@@ -520,6 +532,97 @@ async fn add_to_markov_chain(db_url: &str, message: &Message) -> Result<(), DbEr
     }
 }
 
+pub async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<(), ImportError> {
+    info!("Reading chat export file {}", file_path);
+    let chat_export = match read_chat_export(file_path) {
+        Ok(v) => v,
+        Err(e) => return Err(ImportError::ReadError(e)),
+    };
+
+    info!("Successfully read chat export file; now importing it");
+    let mut chat_data = match read_chat_data(db_url, &chat_export.id).await {
+        Ok(option) => option.unwrap_or_else(|| ChatData {
+            chat_id: chat_export.id,
+            data: HashMap::new(),
+        }),
+        Err(e) => return Err(ImportError::DbError(e)),
+    };
+
+    info!(
+        "There are {} total messages in the chat export, but they may not all be imported",
+        chat_export.messages.len()
+    );
+    let mut num_messages_imported: i64 = 0;
+    let mut users_cache = HashMap::<u64, User>::new();
+    for message in &chat_export.messages {
+        if let Some(from_id_str) = &message.from_id {
+            let from_id = from_id_str.parse::<u64>().unwrap();
+
+            // Fetch the user info from Telegram if we haven't yet
+            if let Vacant(entry) = users_cache.entry(from_id.clone()) {
+                let params = GetChatMemberParams {
+                    chat_id: ChatId::Integer(chat_data.chat_id),
+                    user_id: from_id.clone(),
+                };
+                match api.get_chat_member(&params).await {
+                    Err(e) => {
+                        error!("Failed to fetch user with ID {}: {:?}", from_id, e);
+                    }
+                    Ok(response) => {
+                        let user = match response.result {
+                            ChatMember::Owner(chat_member) => chat_member.user,
+                            ChatMember::Administrator(chat_member) => chat_member.user,
+                            ChatMember::Member(chat_member) => chat_member.user,
+                            ChatMember::Restricted(chat_member) => chat_member.user,
+                            ChatMember::Left(chat_member) => chat_member.user,
+                            ChatMember::Banned(chat_member) => chat_member.user,
+                        };
+                        entry.insert(user);
+                    }
+                }
+            }
+
+            if let Some(user) = users_cache.get(&from_id) {
+                if !user.is_bot {
+                    // Ignore messages that start with a bot command
+                    let include = match &message.contents {
+                        MessageContents::PlainText(_text) => true,
+                        MessageContents::Pieces(pieces) => {
+                            if pieces.len() > 0 {
+                                if let TextPiece::Entity(entity) = &pieces[0] {
+                                    entity.type_field != "bot_command".to_string()
+                                } else {
+                                    true
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if include {
+                        let text = message.to_string();
+                        chat_data.add_message(from_id_str, text.as_str());
+                        chat_data.add_message(ALL, text.as_str());
+                        num_messages_imported += 1;
+                    }
+                }
+            }
+        }
+    }
+    info!("Successfully imported {} messages", num_messages_imported);
+
+    match write_chat_data(db_url, chat_data).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(ImportError::DbError(e)),
+    }
+}
+
+#[derive(Debug)]
+pub enum ImportError {
+    ReadError(import::ReadError),
+    DbError(DbError),
+}
+
 async fn read_chat_data(db_url: &str, chat_id: &i64) -> Result<Option<ChatData>, DbError> {
     let db = connect_to_db(db_url).await?;
     let collection = db.collection(CHATS_COLLECTION_NAME);
@@ -528,7 +631,7 @@ async fn read_chat_data(db_url: &str, chat_id: &i64) -> Result<Option<ChatData>,
         .await;
     match result {
         Ok(chat_data) => {
-            debug!("Read chat data for chat {}: {:?}", chat_id, chat_data);
+            debug!("Read chat data for chat {}", chat_id);
             Ok(chat_data)
         }
         Err(e) => {

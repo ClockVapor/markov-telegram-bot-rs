@@ -13,3 +13,4 @@ tokio = { version = "1.16.0", features = ["full"] }
 mongodb = "2.1.0"
 serde = "1.0.126"
 rand = "0.8.4"
+lazy_static = "1.4.0"

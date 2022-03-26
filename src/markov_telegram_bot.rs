@@ -2,12 +2,15 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 
+use std::sync::Mutex;
+
 use frankenstein::MessageEntityType::TextMention;
 use frankenstein::{
     AsyncApi, AsyncTelegramApi, ChatId, ChatMember, GetChatAdministratorsParamsBuilder,
     GetUpdatesParamsBuilder, Message, MessageEntity, MessageEntityType, SendMessageParamsBuilder,
     User,
 };
+use lazy_static::lazy_static;
 use log::{debug, error, info};
 use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ReplaceOptions};
@@ -35,238 +38,233 @@ type DbError = mongodb::error::Error;
 /// Affirmative responses to questions asked by the bot.
 static YES_STRINGS: [&str; 7] = ["y", "yes", "ye", "ya", "yeah", "yea", "yah"];
 
-#[derive(Default)]
-pub struct MarkovTelegramBot {
-    bot_token: String,
-    db_url: String,
-
+lazy_static! {
     /// Map of prompts that the bot is asking users. First key is chat ID, second key is user ID within that chat.
-    prompts: HashMap<i64, HashMap<u64, Prompt>>,
+    static ref PROMPTS: Mutex<HashMap<i64, HashMap<u64, Prompt>>> = Mutex::new(HashMap::new());
 }
 
-impl MarkovTelegramBot {
-    pub fn new(bot_token: String, db_url: String) -> Self {
-        Self {
-            bot_token,
-            db_url,
-            ..Self::default()
-        }
-    }
+pub async fn run(bot_token: String, db_url: String) -> Result<(), String> {
+    let api = AsyncApi::new(bot_token.as_str());
+    let mut update_params_builder = GetUpdatesParamsBuilder::default();
+    update_params_builder.allowed_updates(vec!["message".to_string()]);
+    let mut update_params = update_params_builder.build().unwrap();
 
-    pub async fn run(&mut self) -> Result<(), String> {
-        let api = AsyncApi::new(self.bot_token.as_str());
-        let mut update_params_builder = GetUpdatesParamsBuilder::default();
-        update_params_builder.allowed_updates(vec!["message".to_string()]);
-        let mut update_params = update_params_builder.build().unwrap();
-
-        info!("Bot started");
-        loop {
-            match api.get_updates(&update_params).await {
-                Ok(response) => {
-                    for update in response.result {
-                        if let Some(message) = update.message {
-                            self.handle_message(&api, &message).await;
-                            update_params = update_params_builder
-                                .offset(update.update_id + 1)
-                                .build()
-                                .unwrap();
-                        }
+    info!("Bot started");
+    loop {
+        match api.get_updates(&update_params).await {
+            Ok(response) => {
+                for update in response.result {
+                    if let Some(message) = update.message {
+                        let api_clone = api.clone();
+                        let db_url_clone = db_url.clone();
+                        tokio::spawn(async move {
+                            handle_message(api_clone, db_url_clone.as_str(), message).await;
+                        });
+                        update_params = update_params_builder
+                            .offset(update.update_id + 1)
+                            .build()
+                            .unwrap();
                     }
                 }
-                Err(e) => {
-                    println!("Failed to get updates: {:?}", e);
-                }
+            }
+            Err(e) => {
+                println!("Failed to get updates: {:?}", e);
             }
         }
     }
+}
 
-    async fn handle_message(&mut self, api: &AsyncApi, message: &Message) {
-        if message.from.is_none() {
+async fn handle_message(api: AsyncApi, db_url: &str, message: Message) {
+    if message.from.is_none() {
+        return;
+    }
+
+    // Don't care if this doesn't work here
+    match remember_message_sender(db_url, &message).await {
+        _ => {}
+    };
+
+    if let Some(text) = &message.text {
+        // Check if the message is a reply to a prompt
+        if let Some(prompt) = original_prompt_for(&message) {
+            match prompt.handle_response(db_url, &message).await {
+                Err(e) => {
+                    error!("Failed to handle prompt response: {:?}", e);
+                    try_reply(&api, &message, "<an error occurred>".to_string()).await;
+                }
+                Ok(reply_text) => {
+                    remove_prompt(message.chat.id, &message.from.as_ref().unwrap().id);
+                    try_reply(&api, &message, reply_text).await;
+                }
+            }
             return;
         }
 
-        // Don't care if this doesn't work here
-        match remember_message_sender(self.db_url.as_str(), message).await {
-            _ => {}
-        };
-
-        if let Some(text) = &message.text {
-            // Check if the message is a reply to a prompt
-            if let Some(prompt) = self.original_prompt_for(message) {
-                match prompt.handle_response(self.db_url.as_str(), message).await {
-                    Err(e) => {
-                        error!("Failed to handle prompt response: {:?}", e);
-                        try_reply(api, message, "<an error occurred>".to_string()).await;
-                    }
-                    Ok(reply_text) => {
-                        try_reply(api, message, reply_text).await;
-                    }
-                }
-                return;
-            }
-
-            // Check for bot commands
-            if let Some(entities) = &message.entities {
-                if let Some(
-                    command @ MessageEntity {
-                        type_field: MessageEntityType::BotCommand,
-                        ..
-                    },
-                ) = entities.get(0)
+        // Check for bot commands
+        if let Some(entities) = &message.entities {
+            if let Some(
+                command @ MessageEntity {
+                    type_field: MessageEntityType::BotCommand,
+                    ..
+                },
+            ) = entities.get(0)
+            {
+                if let Some(command_text) = text
+                    .get((command.offset + 1) as usize..(command.offset + command.length) as usize)
                 {
-                    if let Some(command_text) = text.get(
-                        (command.offset + 1) as usize..(command.offset + command.length) as usize,
-                    ) {
-                        if command_text == "msg" || command_text.starts_with("msg@") {
-                            handle_msg_command_message(
-                                self.db_url.as_str(),
-                                api,
-                                message,
-                                text,
-                                command,
-                                entities.as_slice(),
-                            )
-                            .await;
-                        } else if command_text == "deletemydata"
-                            || command_text.starts_with("deletemydata@")
-                        {
-                            self.handle_delete_my_data_command_message(api, message)
-                                .await;
-                        } else if command_text == "deleteusermydata"
-                            || command_text.starts_with("deleteuserdata@")
-                        {
-                            self.handle_delete_user_data_command_message(
-                                api,
-                                message,
-                                text,
-                                entities.as_slice(),
-                            )
-                            .await;
-                        }
+                    if command_text == "msg" || command_text.starts_with("msg@") {
+                        handle_msg_command_message(
+                            db_url,
+                            &api,
+                            &message,
+                            text,
+                            command,
+                            entities.as_slice(),
+                        )
+                        .await;
+                    } else if command_text == "deletemydata"
+                        || command_text.starts_with("deletemydata@")
+                    {
+                        handle_delete_my_data_command_message(&api, &message).await;
+                    } else if command_text == "deleteusermydata"
+                        || command_text.starts_with("deleteuserdata@")
+                    {
+                        handle_delete_user_data_command_message(
+                            &api,
+                            db_url,
+                            &message,
+                            text,
+                            entities.as_slice(),
+                        )
+                        .await;
                     }
-                    return; // Don't add bot command messages to the Markov chain
                 }
+                return; // Don't add bot command messages to the Markov chain
             }
-
-            // If message was not handled by some bot command, add it to the sending user's Markov chain
-            if let Err(e) = add_to_markov_chain(self.db_url.as_str(), message).await {
-                error!("Failed to add message to Markov chain: {:?}", e);
-            };
         }
-    }
 
-    /// Handles a message with a /deletemydata command.
-    async fn handle_delete_my_data_command_message(&mut self, api: &AsyncApi, message: &Message) {
-        let ask_message_id = match try_reply(
-            api,
-            message,
-            "Are you sure you want to delete your Markov chain data in this group?".to_string(),
-        )
-        .await
-        {
-            None => {
-                return;
-            }
-            Some(result) => result.message_id,
+        // If message was not handled by some bot command, add it to the sending user's Markov chain
+        if let Err(e) = add_to_markov_chain(db_url, &message).await {
+            error!("Failed to add message to Markov chain: {:?}", e);
         };
-
-        let chat_prompts = self.get_chat_prompts(message);
-
-        let prompt = Prompt {
-            message_id: ask_message_id,
-            kind: PromptKind::DeleteMyData,
-        };
-        chat_prompts.insert(message.from.as_ref().unwrap().id, prompt);
-    }
-
-    /// Handles a message with a /deleteuserdata command.
-    async fn handle_delete_user_data_command_message(
-        &mut self,
-        api: &AsyncApi,
-        message: &Message,
-        text: &str,
-        entities: &[MessageEntity],
-    ) {
-        let params = GetChatAdministratorsParamsBuilder::default()
-            .chat_id(ChatId::Integer(message.chat.id))
-            .build()
-            .unwrap();
-        let admins = api.get_chat_administrators(&params).await;
-        match admins {
-            Err(e) => {
-                error!("Failed to fetch chat admins: {:?}", e);
-                try_reply(api, message, "<an error occurred>".to_string()).await;
-            }
-            Ok(admins) => {
-                if !admins.result.iter().any(|chat_member| match chat_member {
-                    ChatMember::Owner(m) => m.user.id == message.from.as_ref().unwrap().id,
-                    ChatMember::Administrator(m) => m.user.id == message.from.as_ref().unwrap().id,
-                    _ => false,
-                }) {
-                    try_reply(api, message, "You aren't an admin.".to_string()).await;
-                    return;
-                }
-                let user_id = match entities.get(1) {
-                    Some(entity) => match get_user_mention(text, entity) {
-                        Some(user_mention) => user_mention.user_id(self.db_url.as_str()).await,
-                        None => Ok(None),
-                    },
-                    None => Ok(None),
-                };
-                match user_id {
-                    Err(_) => {
-                        try_reply(api, message, "<an error occurred>".to_string()).await;
-                    }
-                    Ok(None) => {
-                        try_reply(api, message, "<expected a user mention>".to_string()).await;
-                    }
-                    Ok(Some(user_id)) => {
-                        let ask_message_id = match try_reply(api, message,
-                                                             "Are you sure you want to delete that user's Markov chain data in this group?".to_string()).await {
-                            None => {
-                                try_reply(api, message, "<an error occurred>".to_string()).await;
-                                return;
-                            }
-                            Some(result) => result.message_id,
-                        };
-                        let prompt = Prompt {
-                            message_id: ask_message_id,
-                            kind: PromptKind::DeleteUserData(user_id),
-                        };
-                        self.get_chat_prompts(message)
-                            .insert(message.from.as_ref().unwrap().id, prompt);
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_chat_prompts(&mut self, message: &Message) -> &mut HashMap<u64, Prompt> {
-        if let Vacant(e) = self.prompts.entry(message.chat.id) {
-            e.insert(HashMap::new());
-            self.prompts.get_mut(&message.chat.id).unwrap()
-        } else {
-            self.prompts.get_mut(&message.chat.id).unwrap()
-        }
-    }
-
-    /// Gets the prompt that a message is replying to, if one exists.
-    fn original_prompt_for(&self, message: &Message) -> Option<&Prompt> {
-        if let Some(reply_to_message) = &message.reply_to_message {
-            if let Some(prompts) = self.prompts.get(&message.chat.id) {
-                if let Some(user) = &message.from {
-                    if let Some(prompt) = prompts.get(&user.id) {
-                        if prompt.message_id == reply_to_message.message_id {
-                            return Some(prompt);
-                        }
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
+/// Handles a message with a /deletemydata command.
+async fn handle_delete_my_data_command_message(api: &AsyncApi, message: &Message) {
+    let ask_message_id = match try_reply(
+        api,
+        message,
+        "Are you sure you want to delete your Markov chain data in this group?".to_string(),
+    )
+    .await
+    {
+        None => {
+            return;
+        }
+        Some(result) => result.message_id,
+    };
+
+    let prompt = Prompt {
+        message_id: ask_message_id,
+        kind: PromptKind::DeleteMyData,
+    };
+    add_prompt(message.chat.id, message.from.as_ref().unwrap().id, prompt);
+}
+
+/// Handles a message with a /deleteuserdata command.
+async fn handle_delete_user_data_command_message(
+    api: &AsyncApi,
+    db_url: &str,
+    message: &Message,
+    text: &str,
+    entities: &[MessageEntity],
+) {
+    let params = GetChatAdministratorsParamsBuilder::default()
+        .chat_id(ChatId::Integer(message.chat.id))
+        .build()
+        .unwrap();
+    let admins = api.get_chat_administrators(&params).await;
+    match admins {
+        Err(e) => {
+            error!("Failed to fetch chat admins: {:?}", e);
+            try_reply(api, message, "<an error occurred>".to_string()).await;
+        }
+        Ok(admins) => {
+            if !admins.result.iter().any(|chat_member| match chat_member {
+                ChatMember::Owner(m) => m.user.id == message.from.as_ref().unwrap().id,
+                ChatMember::Administrator(m) => m.user.id == message.from.as_ref().unwrap().id,
+                _ => false,
+            }) {
+                try_reply(api, message, "You aren't an admin.".to_string()).await;
+                return;
+            }
+            let user_id = match entities.get(1) {
+                Some(entity) => match get_user_mention(text, entity) {
+                    Some(user_mention) => user_mention.user_id(db_url).await,
+                    None => Ok(None),
+                },
+                None => Ok(None),
+            };
+            match user_id {
+                Err(_) => {
+                    try_reply(api, message, "<an error occurred>".to_string()).await;
+                }
+                Ok(None) => {
+                    try_reply(api, message, "<expected a user mention>".to_string()).await;
+                }
+                Ok(Some(user_id)) => {
+                    let ask_message_id = match try_reply(api, message,
+                                                         "Are you sure you want to delete that user's Markov chain data in this group?".to_string()).await {
+                        None => {
+                            try_reply(api, message, "<an error occurred>".to_string()).await;
+                            return;
+                        }
+                        Some(result) => result.message_id,
+                    };
+                    let prompt = Prompt {
+                        message_id: ask_message_id,
+                        kind: PromptKind::DeleteUserData(user_id),
+                    };
+                    add_prompt(message.chat.id, message.from.as_ref().unwrap().id, prompt);
+                }
+            }
+        }
+    }
+}
+
+fn add_prompt(chat_id: i64, user_id: u64, prompt: Prompt) {
+    let mut prompts = PROMPTS.lock().unwrap();
+    if let Vacant(e) = prompts.entry(chat_id) {
+        e.insert(HashMap::new());
+    }
+    prompts.get_mut(&chat_id).unwrap().insert(user_id, prompt);
+}
+
+fn remove_prompt(chat_id: i64, user_id: &u64) {
+    let mut prompts = PROMPTS.lock().unwrap();
+    if let Occupied(mut e) = prompts.entry(chat_id) {
+        e.get_mut().remove(user_id);
+    }
+}
+
+/// Gets the prompt that a message is replying to, if one exists.
+fn original_prompt_for(message: &Message) -> Option<Prompt> {
+    if let Some(reply_to_message) = &message.reply_to_message {
+        if let Some(prompts) = PROMPTS.lock().unwrap().get(&message.chat.id) {
+            if let Some(user) = &message.from {
+                if let Some(prompt) = prompts.get(&user.id) {
+                    if prompt.message_id == reply_to_message.message_id {
+                        return Some(prompt.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone)]
 struct Prompt {
     /// Message ID for the message from the bot that initiated this prompt.
     message_id: i32,
@@ -279,6 +277,7 @@ impl Prompt {
     }
 }
 
+#[derive(Clone)]
 enum PromptKind {
     DeleteMyData,
     DeleteUserData(String),

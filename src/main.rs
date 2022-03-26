@@ -1,7 +1,6 @@
 use clap::{App, Arg};
 
 use markov_chain::*;
-use markov_telegram_bot::MarkovTelegramBot;
 
 mod markov_chain;
 mod markov_telegram_bot;
@@ -31,5 +30,5 @@ async fn main() -> Result<(), String> {
 
     let bot_token = args.value_of("TELEGRAM_BOT_TOKEN").unwrap().to_string();
     let db_url = args.value_of("MONGODB_URL").unwrap().to_string();
-    MarkovTelegramBot::new(bot_token, db_url).run().await
+    markov_telegram_bot::run(bot_token, db_url).await
 }

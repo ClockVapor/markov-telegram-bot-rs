@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
-
 use std::sync::Mutex;
 
 use frankenstein::MessageEntityType::TextMention;
@@ -18,7 +17,7 @@ use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
 use MessageEntityType::Mention;
 
-use crate::{MarkovChain, MarkovChainError};
+use crate::{MarkovChainError, TripletMarkovChain};
 
 /// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &str = "all";
@@ -374,10 +373,10 @@ async fn handle_msg_command_message(
     api: &AsyncApi,
     message: &Message,
     text: &str,
-    command: &MessageEntity,
+    _command: &MessageEntity,
     entities: &[MessageEntity],
 ) {
-    let (source, mention_entity) = match entities.get(1) {
+    let (source, _mention_entity) = match entities.get(1) {
         Some(entity) => {
             if let Some(user_mention) = get_user_mention(text, entity) {
                 (Source::SingleUser(user_mention), Some(entity))
@@ -388,31 +387,18 @@ async fn handle_msg_command_message(
         None => (Source::AllUsers, None),
     };
     let reply_text = {
-        let seed = match source {
-            Source::SingleUser(_) => {
-                get_seed(text.get(
-                    (mention_entity.unwrap().offset + mention_entity.unwrap().length) as usize..,
-                ))
+        debug!("Got /msg for {:?}", source);
+        match do_msg_command(db_url, &message.chat.id, &source).await {
+            Ok(Some(text)) => text,
+            Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
+                "<no data>".to_string()
             }
-            Source::AllUsers => get_seed(text.get((command.offset + command.length) as usize..)),
-        };
-        match seed {
-            Err(e) => e,
-            Ok(seed) => {
-                debug!("Got /msg for {:?}", source);
-                match do_msg_command(db_url, &message.chat.id, &source, seed).await {
-                    Ok(Some(text)) => text,
-                    Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
-                        "<no data>".to_string()
-                    }
-                    Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
-                        "<no such seed>".to_string()
-                    }
-                    Err(e) => {
-                        error!("An error occurred executing /msg command: {:?}", e);
-                        "<an error occurred>".to_string()
-                    }
-                }
+            Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
+                "<no such seed>".to_string()
+            }
+            Err(e) => {
+                error!("An error occurred executing /msg command: {:?}", e);
+                "<an error occurred>".to_string()
             }
         }
     };
@@ -476,7 +462,6 @@ async fn do_msg_command<'a>(
     db_url: &str,
     chat_id: &i64,
     source: &Source<'a>,
-    seed: Option<String>,
 ) -> Result<Option<String>, MsgCommandError> {
     let user_id = match source {
         Source::SingleUser(target_user_mention) => target_user_mention.user_id(db_url).await,
@@ -490,7 +475,7 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
-                Some(markov_chain) => match markov_chain.generate(seed) {
+                Some(markov_chain) => match markov_chain.generate(None) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
                 },
@@ -622,7 +607,7 @@ struct ChatData {
     chat_id: i64,
 
     /// HashMap from a Telegram user's ID to their Markov chain.
-    data: HashMap<String, MarkovChain>,
+    data: HashMap<String, TripletMarkovChain>,
 }
 
 impl ChatData {
@@ -632,7 +617,7 @@ impl ChatData {
             let markov_chain = self.data.get_mut(user_id).unwrap();
             markov_chain.add_message(text);
         } else {
-            let mut markov_chain = MarkovChain {
+            let mut markov_chain = TripletMarkovChain {
                 user_id: user_id.to_string(),
                 data: HashMap::new(),
             };

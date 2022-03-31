@@ -388,15 +388,15 @@ async fn handle_msg_command_message(
     text: &str,
     entities: &[MessageEntity],
 ) {
-    let (source, _mention_entity) = match entities.get(1) {
+    let source = match entities.get(1) {
         Some(entity) => {
             if let Some(user_mention) = get_user_mention(text, entity) {
-                (Source::SingleUser(user_mention), Some(entity))
+                Source::SingleUser(user_mention)
             } else {
-                (Source::AllUsers, None)
+                Source::AllUsers
             }
         }
-        None => (Source::AllUsers, None),
+        None => Source::AllUsers,
     };
     let reply_text = {
         debug!("Got /msg for {:?} in chat {}", source, message.chat.id);
@@ -487,6 +487,7 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
+                // TODO: Support seed for TripletMarkovChain
                 Some(markov_chain) => match markov_chain.generate(None) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
@@ -496,6 +497,7 @@ async fn do_msg_command<'a>(
     }
 }
 
+/// Attempts to reply to a message with some text, and returns the sent message if successful.
 async fn try_reply(api: &AsyncApi, reply_to_message: &Message, text: String) -> Option<Message> {
     let params = SendMessageParamsBuilder::default()
         .chat_id(ChatId::Integer(reply_to_message.chat.id))
@@ -512,6 +514,7 @@ async fn try_reply(api: &AsyncApi, reply_to_message: &Message, text: String) -> 
     }
 }
 
+/// Adds a message to its sender's Markov chain and the "all users" Markov chain in the chat.
 async fn add_to_markov_chain(db_url: &str, message: &Message) -> Result<(), DbError> {
     let text = message.text.as_ref().or(message.caption.as_ref());
     match text {
@@ -523,8 +526,8 @@ async fn add_to_markov_chain(db_url: &str, message: &Message) -> Result<(), DbEr
                     data: HashMap::new(),
                 });
             let sender_id_str = message.from.as_ref().unwrap().id.to_string();
-            chat_data.add_message(&sender_id_str, text); // Add to the specific user's Markov chain
-            chat_data.add_message(&ALL.to_string(), text); // Also add to the "all users" Markov chain
+            chat_data.add_message(sender_id_str, text); // Add to the specific user's Markov chain
+            chat_data.add_message(ALL.to_string(), text); // Also add to the "all users" Markov chain
             write_chat_data(db_url, chat_data).await
         }
 
@@ -532,7 +535,9 @@ async fn add_to_markov_chain(db_url: &str, message: &Message) -> Result<(), DbEr
     }
 }
 
-pub async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<(), ImportError> {
+/// Imports a Telegram chat export JSON file into the Markov chains for that chat. Messages sent by bots and messages
+/// starting with a bot command are not included in the import.
+async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<(), ImportError> {
     info!("Reading chat export file {}", file_path);
     let chat_export = match read_chat_export(file_path) {
         Ok(v) => v,
@@ -601,20 +606,25 @@ pub async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Resul
                     };
                     if include {
                         let text = message.to_string();
-                        chat_data.add_message(from_id_str, text.as_str());
-                        chat_data.add_message(ALL, text.as_str());
+                        chat_data.add_message(from_id_str.clone(), text.as_str());
+                        chat_data.add_message(ALL.to_string(), text.as_str());
                         num_messages_imported += 1;
                     }
                 }
             }
         }
     }
-    info!("Successfully imported {} messages", num_messages_imported);
 
-    match write_chat_data(db_url, chat_data).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(ImportError::DbError(e)),
+    let chat_id = chat_data.chat_id.clone();
+    if let Err(e) = write_chat_data(db_url, chat_data).await {
+        return Err(ImportError::DbError(e));
     }
+
+    info!(
+        "Successfully imported {} messages into chat {}",
+        num_messages_imported, chat_id
+    );
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -623,6 +633,7 @@ pub enum ImportError {
     DbError(DbError),
 }
 
+/// Reads the Markov chain data stored for a Telegram chat from the database.
 async fn read_chat_data(db_url: &str, chat_id: &i64) -> Result<Option<ChatData>, DbError> {
     let db = connect_to_db(db_url).await?;
     let collection = db.collection(CHATS_COLLECTION_NAME);
@@ -641,6 +652,7 @@ async fn read_chat_data(db_url: &str, chat_id: &i64) -> Result<Option<ChatData>,
     }
 }
 
+/// Writes Markov chain data for a Telegram chat to the database.
 async fn write_chat_data(db_url: &str, chat_data: ChatData) -> Result<(), DbError> {
     let db = connect_to_db(db_url).await?;
     let collection: Collection<ChatData> = db.collection(CHATS_COLLECTION_NAME);
@@ -669,6 +681,7 @@ async fn write_chat_data(db_url: &str, chat_data: ChatData) -> Result<(), DbErro
     }
 }
 
+/// Connects to a MongoDB database.
 async fn connect_to_db(db_url: &str) -> Result<Database, DbError> {
     let mut client_options = match ClientOptions::parse(db_url).await {
         Ok(client_options) => client_options,
@@ -688,7 +701,7 @@ async fn connect_to_db(db_url: &str) -> Result<Database, DbError> {
     Ok(client.database("markov"))
 }
 
-/// Given a message's text and a `MessageEntity` within it, returns a `UserMention` if one is present.
+/// Given a message's text and a [MessageEntity] within it, returns a [UserMention] if one is present.
 fn get_user_mention<'a>(text: &str, entity: &'a MessageEntity) -> Option<UserMention<'a>> {
     match &entity.type_field {
         Mention => {
@@ -704,6 +717,7 @@ fn get_user_mention<'a>(text: &str, entity: &'a MessageEntity) -> Option<UserMen
     }
 }
 
+/// Data structure containing Markov chains for a Telegram chat.
 #[derive(Serialize, Deserialize, Debug)]
 struct ChatData {
     /// ID of the Telegram chat that this data belongs to.
@@ -715,17 +729,16 @@ struct ChatData {
 
 impl ChatData {
     /// Adds a Telegram message to a user's Markov chain.
-    fn add_message(&mut self, user_id: &str, text: &str) {
-        if self.data.contains_key(user_id) {
-            let markov_chain = self.data.get_mut(user_id).unwrap();
-            markov_chain.add_message(text);
-        } else {
-            let mut markov_chain = TripletMarkovChain {
-                user_id: user_id.to_string(),
-                data: HashMap::new(),
-            };
-            markov_chain.add_message(text);
-            self.data.insert(user_id.to_string(), markov_chain);
+    fn add_message(&mut self, user_id: String, text: &str) {
+        match self.data.entry(user_id.clone()) {
+            Occupied(mut entry) => {
+                entry.get_mut().add_message(text);
+            }
+            Vacant(entry) => {
+                let mut markov_chain = TripletMarkovChain::default();
+                markov_chain.add_message(text);
+                entry.insert(markov_chain);
+            }
         }
     }
 }
@@ -738,24 +751,27 @@ struct UserInfo {
     user_id: String,
 }
 
+/// Enum designating the source of generating a new message (i.e. which user's Markov chain, or the
+/// "all users" Markov chain).
 #[derive(Debug)]
 enum Source<'a> {
     SingleUser(UserMention<'a>),
     AllUsers,
 }
 
+/// Enum for the two types of Telegram user mentions.
 #[derive(Debug)]
 enum UserMention<'a> {
-    /// A mention of the form @username. The contained String will not include the leading @.
+    /// A mention of the form @username. The contained [String] will not include the leading @.
     AtMention(String),
 
-    /// A text mention that is a link to a user that does not have a username.
+    /// A text mention that is a link to a user who does not have a username.
     TextMention(&'a User),
 }
 
 impl<'a> UserMention<'a> {
-    /// If the mention is a TextMention, simply returns the linked user's ID.
-    /// If the mention is an AtMention, fetches the user ID that maps to the username from the database.
+    /// If the mention is a [UserMention::TextMention], simply returns the linked user's ID.
+    /// If the mention is an [UserMention::AtMention], fetches the user ID that maps to the username from the database.
     async fn user_id(&self, db_url: &str) -> Result<Option<String>, DbError> {
         match self {
             UserMention::AtMention(username) => {

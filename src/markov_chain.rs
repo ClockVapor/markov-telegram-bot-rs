@@ -9,7 +9,7 @@ use MarkovChainError::*;
 
 pub type Counter = i64;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkovChain {
     /// HashMap of word (#1) to HashMap of following word (#2) to number of times #2 has followed #1.
     pub data: HashMap<String, HashMap<String, Counter>>,
@@ -118,7 +118,7 @@ impl MarkovChain {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct TripletMarkovChain {
     /// HashMap of two words (#1 and #2) to HashMap of following word (#3) to number of times #3 has followed "#1 #2".
     pub data: HashMap<String, HashMap<String, Counter>>,
@@ -386,10 +386,22 @@ mod tests {
             markov_chain.add_message("one two three");
             assert_eq!(
                 HashMap::from([
-                    ("".to_string(), HashMap::from([("one".to_string(), 1 as Counter)])),
-                    ("one".to_string(), HashMap::from([("two".to_string(), 1 as Counter)])),
-                    ("two".to_string(), HashMap::from([("three".to_string(), 1 as Counter)])),
-                    ("three".to_string(), HashMap::from([("".to_string(), 1 as Counter)])),
+                    (
+                        "".to_string(),
+                        HashMap::from([("one".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "one".to_string(),
+                        HashMap::from([("two".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "two".to_string(),
+                        HashMap::from([("three".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "three".to_string(),
+                        HashMap::from([("".to_string(), 1 as Counter)])
+                    ),
                 ]),
                 markov_chain.data
             );
@@ -429,13 +441,15 @@ mod tests {
             let mut markov_chain = TripletMarkovChain::default();
             assert_eq!(HashMap::default(), markov_chain.data);
 
-            markov_chain.add_word_triplet(("one".to_string(), "two".to_string()), "three".to_string());
+            markov_chain
+                .add_word_triplet(("one".to_string(), "two".to_string()), "three".to_string());
             assert_eq!(
                 HashMap::from([("three".to_string(), 1 as Counter)]),
                 *markov_chain.data.get("one two").unwrap()
             );
 
-            markov_chain.add_word_triplet(("one".to_string(), "two".to_string()), "three".to_string());
+            markov_chain
+                .add_word_triplet(("one".to_string(), "two".to_string()), "three".to_string());
             assert_eq!(
                 HashMap::from([("three".to_string(), 2 as Counter)]),
                 *markov_chain.data.get("one two").unwrap()
@@ -451,13 +465,21 @@ mod tests {
                 )]),
             };
 
-            markov_chain.remove_word_triplet(&("one".to_string(), "two".to_string()), "three", &(2 as Counter));
+            markov_chain.remove_word_triplet(
+                &("one".to_string(), "two".to_string()),
+                "three",
+                &(2 as Counter),
+            );
             assert_eq!(
                 HashMap::from([("three".to_string(), 1 as Counter)]),
                 *markov_chain.data.get("one two").unwrap()
             );
 
-            markov_chain.remove_word_triplet(&("one".to_string(), "two".to_string()), "three", &(1 as Counter));
+            markov_chain.remove_word_triplet(
+                &("one".to_string(), "two".to_string()),
+                "three",
+                &(1 as Counter),
+            );
             assert!(markov_chain.data.get("one two").is_none());
         }
 
@@ -469,11 +491,26 @@ mod tests {
             markov_chain.add_message("one two three");
             assert_eq!(
                 HashMap::from([
-                    (" ".to_string(), HashMap::from([("one".to_string(), 1 as Counter)])),
-                    (" one".to_string(), HashMap::from([("two".to_string(), 1 as Counter)])),
-                    ("one two".to_string(), HashMap::from([("three".to_string(), 1 as Counter)])),
-                    ("two three".to_string(), HashMap::from([("".to_string(), 1 as Counter)])),
-                    ("three ".to_string(), HashMap::from([("".to_string(), 1 as Counter)])),
+                    (
+                        " ".to_string(),
+                        HashMap::from([("one".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        " one".to_string(),
+                        HashMap::from([("two".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "one two".to_string(),
+                        HashMap::from([("three".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "two three".to_string(),
+                        HashMap::from([("".to_string(), 1 as Counter)])
+                    ),
+                    (
+                        "three ".to_string(),
+                        HashMap::from([("".to_string(), 1 as Counter)])
+                    ),
                 ]),
                 markov_chain.data
             );

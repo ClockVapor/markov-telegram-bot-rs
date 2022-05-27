@@ -56,6 +56,7 @@ pub async fn run(
             error!("Failed to import: {:?}", e);
             return Err("Failed to import".to_string());
         }
+        return Ok(());
     }
 
     let mut update_params_builder = GetUpdatesParamsBuilder::default();
@@ -621,8 +622,10 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
     }
 
     info!(
-        "Successfully imported {} messages into chat {}",
-        num_messages_imported, chat_id
+        "Successfully imported {}/{} messages into chat {}",
+        num_messages_imported,
+        chat_export.messages.len(),
+        chat_id
     );
     Ok(())
 }

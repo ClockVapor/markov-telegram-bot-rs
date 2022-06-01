@@ -592,9 +592,9 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
                 if !user.is_bot {
                     // Ignore messages that start with a bot command
                     let include = match &message.contents {
-                        MessageContents::PlainText(_text) => true,
+                        MessageContents::PlainText(_) => true,
                         MessageContents::Pieces(pieces) => {
-                            if pieces.len() > 0 {
+                            if !pieces.is_empty() {
                                 if let TextPiece::Entity(entity) = &pieces[0] {
                                     entity.type_field != "bot_command".to_string()
                                 } else {

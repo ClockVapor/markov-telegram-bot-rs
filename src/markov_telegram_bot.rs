@@ -559,7 +559,7 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
         chat_export.messages.len()
     );
     let mut num_messages_imported: i64 = 0;
-    let mut users_cache = HashMap::<u64, User>::new();
+    let mut users_cache = HashMap::<u64, Option<User>>::new();
     for message in &chat_export.messages {
         if let Some(from_id_str) = &message.from_id {
             let from_id = from_id_str.parse::<u64>().unwrap();
@@ -573,6 +573,7 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
                 match api.get_chat_member(&params).await {
                     Err(e) => {
                         error!("Failed to fetch user with ID {}: {:?}", from_id, e);
+                        entry.insert(None);
                     }
                     Ok(response) => {
                         let user = match response.result {
@@ -583,12 +584,12 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
                             ChatMember::Left(chat_member) => chat_member.user,
                             ChatMember::Banned(chat_member) => chat_member.user,
                         };
-                        entry.insert(user);
+                        entry.insert(Some(user));
                     }
                 }
             }
 
-            if let Some(user) = users_cache.get(&from_id) {
+            if let Some(Some(user)) = users_cache.get(&from_id) {
                 if !user.is_bot {
                     // Ignore messages that start with a bot command
                     let include = match &message.contents {

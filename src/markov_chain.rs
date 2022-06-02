@@ -146,6 +146,7 @@ impl TripletMarkovChain {
         let mut pair = match seed {
             // Use the given seed word
             Some(word) => {
+                let word = word.to_lowercase();
                 let word_encoded = encode_db_field_name(&word);
                 match self.meta.get(&word_encoded) {
                     None => {
@@ -155,10 +156,14 @@ impl TripletMarkovChain {
                         // 1. Get all keys in `data` that end with `word`.
                         // 2. Build frequency map for words that follow `word`.
                         // 3. Pick random following word from the frequency map, and use DECODED version of it in pair.
-                        let mut frequency_map = HashMap::<String, Counter>::new();
+                        let mut frequency_map = HashMap::<(String, String), Counter>::new();
                         for key in key_set {
+                            let second_encoded = encode_db_field_name(&string_to_pair(key).1);
                             for (following_word, _count) in self.data.get(key).unwrap() {
-                                match frequency_map.entry(following_word.clone()) {
+                                match frequency_map.entry((
+                                    second_encoded.clone(),
+                                    decode_db_field_name(&following_word),
+                                )) {
                                     Entry::Occupied(mut entry) => {
                                         entry.insert(entry.get() + 1);
                                     }
@@ -169,10 +174,7 @@ impl TripletMarkovChain {
                             }
                         }
 
-                        (
-                            word_encoded,
-                            decode_db_field_name(&choose_from_frequency_map(&frequency_map)),
-                        )
+                        choose_from_frequency_map(&frequency_map).clone()
                     }
                 }
             }
@@ -189,6 +191,8 @@ impl TripletMarkovChain {
             },
         };
 
+        println!("FOO: {:?}", pair);
+
         let mut result: Vec<String> = vec![];
         if pair.0.as_str() != "" {
             result.push(decode_db_field_name(&pair.0.clone()));
@@ -200,7 +204,7 @@ impl TripletMarkovChain {
                 None => {
                     // Should never happen based on how we build the Markov chains
                     error!(
-                        "Expected pair ({}, {}) to be in the Markov chain but it wasn't",
+                        "Expected pair (\"{}\", \"{}\") to be in the Markov chain but it wasn't",
                         pair.0, pair.1
                     );
                     return Err(InternalError);
@@ -245,7 +249,6 @@ impl TripletMarkovChain {
     /// third one more time).
     fn add_word_triplet(&mut self, pair: (String, String), third: String) {
         let pair_string_encoded = pair_to_string(&pair);
-        let second_encoded = encode_db_field_name(&pair.1);
         let third_encoded = encode_db_field_name(&third);
 
         match self.data.entry(pair_string_encoded.clone()) {
@@ -269,14 +272,9 @@ impl TripletMarkovChain {
         // Keep track of the keys in `data` ending with the second word. This makes it easy to generate messages
         // with a given seed word. Also count the "cleaned" version of the second word, which is all lowercase with
         // leading and trailing non-alphanumeric characters trimmed off.
-        let second_cleaned_encoded = encode_db_field_name(
-            pair.1
-                .to_lowercase()
-                .trim_matches(|c: char| !c.is_alphanumeric()),
-        );
-        for word in vec![second_encoded, second_cleaned_encoded] {
-            if !word.is_empty() {
-                match self.meta.entry(word) {
+        for seed_encoded in get_associated_seeds_encoded(&pair.1) {
+            if !seed_encoded.is_empty() {
+                match self.meta.entry(seed_encoded) {
                     Entry::Occupied(mut entry) => {
                         entry.get_mut().insert(pair_string_encoded.clone());
                     }
@@ -306,11 +304,12 @@ impl TripletMarkovChain {
 
                         // The second word is no longer associated with this `data` key, since we just removed it
                         // from `data`
-                        let second_encoded = encode_db_field_name(&pair.1);
-                        let associated_keys_set = self.meta.get_mut(&second_encoded).unwrap();
-                        associated_keys_set.remove(&pair_string_encoded);
-                        if associated_keys_set.is_empty() {
-                            self.meta.remove(&second_encoded);
+                        for seed_encoded in get_associated_seeds_encoded(&pair.1) {
+                            let associated_keys_set = self.meta.get_mut(&seed_encoded).unwrap();
+                            associated_keys_set.remove(&pair_string_encoded);
+                            if associated_keys_set.is_empty() {
+                                self.meta.remove(&seed_encoded);
+                            }
                         }
                     }
                 }
@@ -406,6 +405,17 @@ fn decode_db_field_name(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Gets a `HashSet` of all encoded seed words associated with the given word.
+fn get_associated_seeds_encoded(decoded_word: &str) -> HashSet<String> {
+    let lowercase_encoded = encode_db_field_name(&decoded_word.to_lowercase());
+    let cleaned_encoded = encode_db_field_name(
+        decoded_word
+            .to_lowercase()
+            .trim_matches(|c: char| !c.is_alphanumeric()),
+    );
+    HashSet::from([lowercase_encoded, cleaned_encoded])
 }
 
 #[cfg(test)]
@@ -678,38 +688,52 @@ mod tests {
             let mut markov_chain = TripletMarkovChain::default();
             for _ in 0..3 {
                 markov_chain
-                    .add_word_triplet(("one".to_string(), "two".to_string()), "three".to_string());
+                    .add_word_triplet(("one".to_string(), "two,".to_string()), "three".to_string());
             }
             assert_eq!(
-                HashMap::from([("three".to_string(), 3 as Counter)]),
-                *markov_chain.data.get("one two").unwrap()
-            );
-            assert_eq!(
-                HashSet::from(["one two".to_string()]),
-                *markov_chain.meta.get("two").unwrap()
+                TripletMarkovChain {
+                    data: HashMap::from([(
+                        "one two,".to_string(),
+                        HashMap::from([("three".to_string(), 3 as Counter)])
+                    ),]),
+                    meta: HashMap::from([
+                        ("two,".to_string(), HashSet::from(["one two,".to_string()])),
+                        ("two".to_string(), HashSet::from(["one two,".to_string()])),
+                    ]),
+                },
+                markov_chain
             );
 
             markov_chain.remove_word_triplet(
-                &("one".to_string(), "two".to_string()),
+                &("one".to_string(), "two,".to_string()),
                 "three",
                 &(2 as Counter),
             );
             assert_eq!(
-                HashMap::from([("three".to_string(), 1 as Counter)]),
-                *markov_chain.data.get("one two").unwrap()
+                TripletMarkovChain {
+                    data: HashMap::from([(
+                        "one two,".to_string(),
+                        HashMap::from([("three".to_string(), 1 as Counter)])
+                    ),]),
+                    meta: HashMap::from([
+                        ("two,".to_string(), HashSet::from(["one two,".to_string()])),
+                        ("two".to_string(), HashSet::from(["one two,".to_string()])),
+                    ]),
+                },
+                markov_chain
             );
-            assert_eq!(
-                HashSet::from(["one two".to_string()]),
-                *markov_chain.meta.get("two").unwrap()
-            );
-
             markov_chain.remove_word_triplet(
-                &("one".to_string(), "two".to_string()),
+                &("one".to_string(), "two,".to_string()),
                 "three",
                 &(1 as Counter),
             );
-            assert!(markov_chain.data.get("one two").is_none());
-            assert!(markov_chain.meta.get("two").is_none());
+            assert_eq!(
+                TripletMarkovChain {
+                    data: HashMap::default(),
+                    meta: HashMap::default(),
+                },
+                markov_chain
+            );
         }
 
         #[test]
@@ -854,12 +878,21 @@ mod tests {
                     ]),
                     meta: HashMap::from([
                         ("\\$one".to_string(), HashSet::from([" $one".to_string()])),
+                        ("one".to_string(), HashSet::from([" $one".to_string()])),
                         (
                             "\\$two".to_string(),
                             HashSet::from(["\\$one $two".to_string()])
                         ),
                         (
+                            "two".to_string(),
+                            HashSet::from(["\\$one $two".to_string()])
+                        ),
+                        (
                             "\\$three".to_string(),
+                            HashSet::from(["\\$two $three".to_string()])
+                        ),
+                        (
+                            "three".to_string(),
                             HashSet::from(["\\$two $three".to_string()])
                         ),
                     ]),
@@ -906,6 +939,67 @@ mod tests {
                 }
                 Err(e) => {
                     panic!("Received MarkovChainError: {:?}", e);
+                }
+            }
+        }
+
+        #[test]
+        fn test_generate_cleaned_seed() {
+            let mut markov_chain = TripletMarkovChain::default();
+            markov_chain.add_message("One, two, three!");
+            assert_eq!(
+                TripletMarkovChain {
+                    data: HashMap::from([
+                        (
+                            " ".to_string(),
+                            HashMap::from([("One,".to_string(), 1 as Counter)])
+                        ),
+                        (
+                            " One,".to_string(),
+                            HashMap::from([("two,".to_string(), 1 as Counter)])
+                        ),
+                        (
+                            "One, two,".to_string(),
+                            HashMap::from([("three!".to_string(), 1 as Counter)])
+                        ),
+                        (
+                            "two, three!".to_string(),
+                            HashMap::from([("".to_string(), 1 as Counter)])
+                        ),
+                        (
+                            "three! ".to_string(),
+                            HashMap::from([("".to_string(), 1 as Counter)])
+                        ),
+                    ]),
+                    meta: HashMap::from([
+                        ("one,".to_string(), HashSet::from([" One,".to_string()])),
+                        ("one".to_string(), HashSet::from([" One,".to_string()])),
+                        ("two,".to_string(), HashSet::from(["One, two,".to_string()])),
+                        ("two".to_string(), HashSet::from(["One, two,".to_string()])),
+                        (
+                            "three!".to_string(),
+                            HashSet::from(["two, three!".to_string()])
+                        ),
+                        (
+                            "three".to_string(),
+                            HashSet::from(["two, three!".to_string()])
+                        ),
+                    ]),
+                },
+                markov_chain
+            );
+
+            for seed in vec!["One,", "one,", "One", "one"] {
+                match markov_chain.generate(Some(seed.to_string())) {
+                    Ok(result) => {
+                        assert_eq!(
+                            vec!["One,".to_string(), "two,".to_string(), "three!".to_string()],
+                            result
+                        );
+                    }
+                    Err(e) => {
+                        panic!("Received MarkovChainError: {:?}", e);
+                    }
                 }
             }
         }

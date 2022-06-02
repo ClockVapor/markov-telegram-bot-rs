@@ -82,7 +82,7 @@ pub async fn run(
                 }
             }
             Err(e) => {
-                println!("Failed to get updates: {:?}", e);
+                error!("Failed to get updates: {:?}", e);
             }
         }
     }

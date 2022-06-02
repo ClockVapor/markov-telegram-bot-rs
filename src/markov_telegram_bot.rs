@@ -16,6 +16,7 @@ use mongodb::bson::doc;
 use mongodb::options::{ClientOptions, ReplaceOptions};
 use mongodb::{Client, Collection, Database};
 use serde::{Deserialize, Serialize};
+use substring::Substring;
 use MessageEntityType::Mention;
 
 use crate::import::{MessageContents, TextPiece};
@@ -389,19 +390,61 @@ async fn handle_msg_command_message(
     text: &str,
     entities: &[MessageEntity],
 ) {
-    let source = match entities.get(1) {
+    let command_entity = entities.get(0).unwrap();
+    let (source, seed) = match entities.get(1) {
         Some(entity) => {
             if let Some(user_mention) = get_user_mention(text, entity) {
-                Source::SingleUser(user_mention)
+                let remaining_text = text
+                    .substring((entity.offset + entity.length) as usize, text.len())
+                    .trim()
+                    .to_string();
+                (
+                    Source::SingleUser(user_mention),
+                    if remaining_text.is_empty() {
+                        None
+                    } else {
+                        Some(remaining_text)
+                    },
+                )
             } else {
-                Source::AllUsers
+                let remaining_text = text
+                    .substring(
+                        (command_entity.offset + command_entity.length) as usize,
+                        text.len(),
+                    )
+                    .trim()
+                    .to_string();
+                (
+                    Source::AllUsers,
+                    if remaining_text.is_empty() {
+                        None
+                    } else {
+                        Some(remaining_text)
+                    },
+                )
             }
         }
-        None => Source::AllUsers,
+        None => {
+            let remaining_text = text
+                .substring(
+                    (command_entity.offset + command_entity.length) as usize,
+                    text.len(),
+                )
+                .trim()
+                .to_string();
+            (
+                Source::AllUsers,
+                if remaining_text.is_empty() {
+                    None
+                } else {
+                    Some(remaining_text)
+                },
+            )
+        }
     };
     let reply_text = {
         debug!("Got /msg for {:?} in chat {}", source, message.chat.id);
-        match do_msg_command(db_url, &message.chat.id, &source).await {
+        match do_msg_command(db_url, &message.chat.id, &source, seed).await {
             Ok(Some(text)) => text,
             Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
                 "<no data>".to_string()
@@ -475,6 +518,7 @@ async fn do_msg_command<'a>(
     db_url: &str,
     chat_id: &i64,
     source: &Source<'a>,
+    seed: Option<String>,
 ) -> Result<Option<String>, MsgCommandError> {
     let user_id = match source {
         Source::SingleUser(target_user_mention) => target_user_mention.user_id(db_url).await,
@@ -488,8 +532,7 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
-                // TODO: Support seed for TripletMarkovChain
-                Some(markov_chain) => match markov_chain.generate(None) {
+                Some(markov_chain) => match markov_chain.generate(seed) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
                 },

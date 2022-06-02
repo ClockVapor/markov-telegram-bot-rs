@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -396,32 +395,16 @@ async fn handle_msg_command_message(
             if let Some(user_mention) = get_user_mention(text, entity) {
                 let remaining_text = text
                     .substring((entity.offset + entity.length) as usize, text.len())
-                    .trim()
-                    .to_string();
-                (
-                    Source::SingleUser(user_mention),
-                    if remaining_text.is_empty() {
-                        None
-                    } else {
-                        Some(remaining_text)
-                    },
-                )
+                    .trim();
+                (Source::SingleUser(user_mention), get_seed(remaining_text))
             } else {
                 let remaining_text = text
                     .substring(
                         (command_entity.offset + command_entity.length) as usize,
                         text.len(),
                     )
-                    .trim()
-                    .to_string();
-                (
-                    Source::AllUsers,
-                    if remaining_text.is_empty() {
-                        None
-                    } else {
-                        Some(remaining_text)
-                    },
-                )
+                    .trim();
+                (Source::AllUsers, get_seed(remaining_text))
             }
         }
         None => {
@@ -430,49 +413,40 @@ async fn handle_msg_command_message(
                     (command_entity.offset + command_entity.length) as usize,
                     text.len(),
                 )
-                .trim()
-                .to_string();
-            (
-                Source::AllUsers,
-                if remaining_text.is_empty() {
-                    None
-                } else {
-                    Some(remaining_text)
-                },
-            )
+                .trim();
+            (Source::AllUsers, get_seed(remaining_text))
         }
     };
+
     let reply_text = {
         debug!("Got /msg for {:?} in chat {}", source, message.chat.id);
-        match do_msg_command(db_url, &message.chat.id, &source, seed).await {
-            Ok(Some(text)) => text,
-            Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
-                "<no data>".to_string()
-            }
-            Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
-                "<no such seed>".to_string()
-            }
-            Err(e) => {
-                error!("An error occurred executing /msg command: {:?}", e);
-                "<an error occurred>".to_string()
-            }
+        match seed {
+            Err(e) => e,
+            Ok(seed) => match do_msg_command(db_url, &message.chat.id, &source, seed).await {
+                Ok(Some(text)) => text,
+                Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
+                    "<no data>".to_string()
+                }
+                Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
+                    "<no such seed>".to_string()
+                }
+                Err(e) => {
+                    error!("An error occurred executing /msg command: {:?}", e);
+                    "<an error occurred>".to_string()
+                }
+            },
         }
     };
     try_reply(api, message, reply_text).await;
 }
 
-/// Parses up to one seed value from the given optional string. Err is returned if more than one seed value is given.
-fn get_seed(text: Option<&str>) -> Result<Option<String>, String> {
-    match text {
-        Some(text) => {
-            let parts: Vec<&str> = text.split_whitespace().collect();
-            match parts.len().cmp(&1_usize) {
-                Ordering::Equal => Ok(Some(parts.get(0).unwrap().to_string())),
-                Ordering::Greater => Err("<up to one seed word can be provided>".to_string()),
-                Ordering::Less => Ok(None),
-            }
-        }
-        None => Ok(None),
+/// Parses up to one seed value from the given string. Err is returned if more than one seed value is given.
+fn get_seed(text: &str) -> Result<Option<String>, String> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    match parts.len().cmp(&1_usize) {
+        Ordering::Equal => Ok(Some(parts.get(0).unwrap().to_string())),
+        Ordering::Greater => Err("<up to one seed word can be provided>".to_string()),
+        Ordering::Less => Ok(None),
     }
 }
 

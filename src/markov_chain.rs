@@ -267,16 +267,24 @@ impl TripletMarkovChain {
         }
 
         // Keep track of the keys in `data` ending with the second word. This makes it easy to generate messages
-        // with a given seed word.
-        if !second_encoded.is_empty() {
-            match self.meta.entry(second_encoded) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().insert(pair_string_encoded);
-                }
-                Entry::Vacant(entry) => {
-                    let mut set = HashSet::new();
-                    set.insert(pair_string_encoded);
-                    entry.insert(set);
+        // with a given seed word. Also count the "cleaned" version of the second word, which is all lowercase with
+        // leading and trailing non-alphanumeric characters trimmed off.
+        let second_cleaned_encoded = encode_db_field_name(
+            pair.1
+                .to_lowercase()
+                .trim_matches(|c: char| !c.is_alphanumeric()),
+        );
+        for word in vec![second_encoded, second_cleaned_encoded] {
+            if !word.is_empty() {
+                match self.meta.entry(word) {
+                    Entry::Occupied(mut entry) => {
+                        entry.get_mut().insert(pair_string_encoded.clone());
+                    }
+                    Entry::Vacant(entry) => {
+                        let mut set = HashSet::new();
+                        set.insert(pair_string_encoded.clone());
+                        entry.insert(set);
+                    }
                 }
             }
         }

@@ -430,6 +430,12 @@ async fn handle_msg_command_message(
                 Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
                     "<no such seed>".to_string()
                 }
+                Err(MsgCommandError::MarkovChainError(
+                    MarkovChainError::LengthRequirementInvalid,
+                )) => "<invalid length requirement>".to_string(),
+                Err(MsgCommandError::MarkovChainError(
+                    MarkovChainError::CannotMeetLengthRequirement,
+                )) => "<could not meet length requirement>".to_string(),
                 Err(e) => {
                     error!("An error occurred executing /msg command: {:?}", e);
                     "<an error occurred>".to_string()
@@ -506,7 +512,7 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
-                Some(markov_chain) => match markov_chain.generate(seed) {
+                Some(markov_chain) => match markov_chain.generate(seed, None) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
                 },

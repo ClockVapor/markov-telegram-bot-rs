@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, LinkedList};
 
 use log::error;
 use rand::Rng;
@@ -137,13 +137,23 @@ pub struct TripletMarkovChain {
 }
 
 impl TripletMarkovChain {
-    /// Generates a Vec of words from the Markov chain. An optional seed word can be given to start with; otherwise,
-    /// a weighted random one will be chosen based on starting words in the Markov chain.
-    pub fn generate(&self, seed: Option<String>) -> Result<Vec<String>, MarkovChainError> {
+    /// Generates a `LinkedList` of words from the Markov chain. An optional seed word can be given to start with;
+    /// otherwise, a weighted random one will be chosen based on starting words in the Markov chain.
+    pub fn generate(
+        &self,
+        seed: Option<String>,
+        length_requirement: Option<LengthRequirement>,
+    ) -> Result<Vec<String>, MarkovChainError> {
         if self.data.is_empty() {
             return Err(Empty);
         }
-        let mut pair = match seed {
+        if let Some(ref length_requirement) = length_requirement {
+            if !length_requirement.is_valid() {
+                return Err(LengthRequirementInvalid);
+            }
+        }
+
+        let mut starts = match seed {
             // Use the given seed word
             Some(word) => {
                 let word = word.to_lowercase();
@@ -158,67 +168,101 @@ impl TripletMarkovChain {
                         // 3. Pick random following word from the frequency map, and use DECODED version of it in pair.
                         let mut frequency_map = HashMap::<(String, String), Counter>::new();
                         for key in key_set {
-                            let second_encoded = encode_db_field_name(&string_to_pair(key).1);
-                            for (following_word, _count) in self.data.get(key).unwrap() {
-                                match frequency_map.entry((
-                                    second_encoded.clone(),
-                                    decode_db_field_name(&following_word),
-                                )) {
-                                    Entry::Occupied(mut entry) => {
-                                        entry.insert(entry.get() + 1);
-                                    }
-                                    Entry::Vacant(entry) => {
-                                        entry.insert(1);
-                                    }
-                                }
-                            }
+                            frequency_map.insert(
+                                string_to_pair(key),
+                                self.data.get(key).unwrap().values().sum(),
+                            );
                         }
-
-                        choose_from_frequency_map(&frequency_map).clone()
+                        frequency_map
                     }
                 }
             }
-            // Pick a random starting seed word
-            None => match self
-                .data
-                .get(&pair_to_string(&("".to_string(), "".to_string())))
-            {
-                None => return Err(Empty),
-                Some(starting_word_map) => (
-                    "".to_string(),
-                    decode_db_field_name(&choose_from_frequency_map(starting_word_map).clone()),
-                ),
-            },
+
+            // Use the default starting point, which will select a random starting word
+            None => HashMap::from([(("".to_string(), "".to_string()), 1)]),
         };
 
-        println!("FOO: {:?}", pair);
-
-        let mut result: Vec<String> = vec![];
-        if pair.0.as_str() != "" {
-            result.push(decode_db_field_name(&pair.0.clone()));
+        while !starts.is_empty() {
+            let start = choose_from_frequency_map(&starts).clone();
+            starts.remove(&start);
+            if let Ok(path) = self.generate_internal(&length_requirement, start, 0) {
+                let mut result = Vec::new();
+                for word in path {
+                    result.push(word);
+                }
+                return Ok(result);
+            }
         }
 
-        while pair.1.as_str() != "" {
-            result.push(pair.1.clone());
-            match self.data.get(&pair_to_string(&pair)) {
-                None => {
-                    // Should never happen based on how we build the Markov chains
-                    error!(
-                        "Expected pair (\"{}\", \"{}\") to be in the Markov chain but it wasn't",
-                        pair.0, pair.1
-                    );
-                    return Err(InternalError);
-                }
-                Some(word_map) => {
-                    pair = (
-                        encode_db_field_name(&pair.1),
-                        decode_db_field_name(&choose_from_frequency_map(word_map).clone()),
-                    );
+        Err(MarkovChainError::CannotMeetLengthRequirement)
+    }
+
+    /// Internal function to recursively generate a message.
+    fn generate_internal(
+        &self,
+        length_requirement: &Option<LengthRequirement>,
+        start: (String, String),
+        current_length: i32,
+    ) -> Result<LinkedList<String>, MarkovChainError> {
+        let at_path_end = start.0.as_str() != "" && start.1.as_str() == "";
+
+        if let Some(length_requirement) = length_requirement {
+            // If the length requirement is not satisfied, check if we need more or less words in the message
+            if !length_requirement.is_satisfied_by(current_length) {
+                let difference = length_requirement.difference(current_length);
+                // If we need less words, or if we need more and we're at the end of a path, then this path cannot meet
+                // the length requirement.
+                if difference < 0 || (at_path_end && difference > 0) {
+                    return Err(MarkovChainError::CannotMeetLengthRequirement);
                 }
             }
         }
 
-        Ok(result)
+        if at_path_end {
+            return Ok(LinkedList::new());
+        } else {
+            let is_real_word = start.1.as_str() != "";
+            let queue = self.get_connections_in_weighted_random_order(&start);
+            for pair in queue {
+                let tail = self.generate_internal(
+                    length_requirement,
+                    pair,
+                    current_length + if is_real_word { 1 } else { 0 },
+                );
+                if let Ok(mut tail) = tail {
+                    if is_real_word {
+                        tail.push_front(start.1);
+                    }
+                    return Ok(tail);
+                }
+            }
+        }
+
+        Err(MarkovChainError::CannotMeetLengthRequirement)
+    }
+
+    /// Returns a `Vec` of all connections for the given starting pair, in a weighted random order.
+    fn get_connections_in_weighted_random_order(
+        &self,
+        pair: &(String, String),
+    ) -> Vec<(String, String)> {
+        let pair_string = pair_to_string(pair);
+        match self.data.get(&pair_string) {
+            Some(word_map) => {
+                let mut connections = Vec::with_capacity(word_map.len());
+                let second_encoded = encode_db_field_name(&pair.1);
+                let mut word_map = word_map.clone();
+                while !word_map.is_empty() {
+                    let selected = choose_from_frequency_map(&word_map).clone();
+                    word_map.remove(&selected);
+                    let selected_decoded = decode_db_field_name(&selected);
+                    connections.push((second_encoded.clone(), selected_decoded));
+                }
+                connections
+            }
+
+            None => Vec::new(),
+        }
     }
 
     /// Adds each word pair in the given &str (separated by whitespace) to the Markov chain.
@@ -324,11 +368,63 @@ pub enum MarkovChainError {
     /// A generating operation was attempted on an empty Markov chain.
     Empty,
 
-    /// A seed was given for a Markov chain operation, but the Markov chain doesn't contain the seed.
+    /// A seed was given for a generation operation, but the Markov chain doesn't contain the seed.
     NoSuchSeed,
+
+    /// A length requirement was given for a generated message, but it is invalid.
+    LengthRequirementInvalid,
+
+    /// A length requirement was given for a generated message, but it couldn't be met.
+    CannotMeetLengthRequirement,
 
     /// Catch-all for unexpected Markov chain errors.
     InternalError,
+}
+
+pub struct LengthRequirement {
+    pub value: i32,
+    pub comparison_operator: ComparisonOperator,
+}
+
+impl LengthRequirement {
+    /// Returns whether or not the `LengthRequirement` makes sense.
+    pub fn is_valid(&self) -> bool {
+        match self.comparison_operator {
+            ComparisonOperator::LessThan => self.value > 1,
+            ComparisonOperator::LessThanOrEqualTo => self.value > 0,
+            ComparisonOperator::EqualTo => self.value > 0,
+            ComparisonOperator::GreaterThan => self.value > 0,
+            ComparisonOperator::GreaterThanOrEqualTo => self.value > 1,
+        }
+    }
+
+    pub fn difference(&self, n: i32) -> i32 {
+        match self.comparison_operator {
+            ComparisonOperator::LessThan => self.value - n - 1,
+            ComparisonOperator::LessThanOrEqualTo => self.value - n,
+            ComparisonOperator::EqualTo => self.value - n,
+            ComparisonOperator::GreaterThan => self.value - n + 1,
+            ComparisonOperator::GreaterThanOrEqualTo => self.value - n,
+        }
+    }
+
+    pub fn is_satisfied_by(&self, n: i32) -> bool {
+        match self.comparison_operator {
+            ComparisonOperator::LessThan => n < self.value,
+            ComparisonOperator::LessThanOrEqualTo => n <= self.value,
+            ComparisonOperator::EqualTo => n == self.value,
+            ComparisonOperator::GreaterThan => n > self.value,
+            ComparisonOperator::GreaterThanOrEqualTo => n >= self.value,
+        }
+    }
+}
+
+pub enum ComparisonOperator {
+    LessThan,
+    LessThanOrEqualTo,
+    EqualTo,
+    GreaterThan,
+    GreaterThanOrEqualTo,
 }
 
 /// Chooses a weighted random item from a frequency map.
@@ -900,7 +996,7 @@ mod tests {
                 markov_chain
             );
 
-            match markov_chain.generate(None) {
+            match markov_chain.generate(None, None) {
                 Ok(result) => {
                     assert_eq!(
                         vec!["$one".to_string(), "$two".to_string(), "$three".to_string()],
@@ -912,7 +1008,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$one".to_string())) {
+            match markov_chain.generate(Some("$one".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(
                         vec!["$one".to_string(), "$two".to_string(), "$three".to_string()],
@@ -924,7 +1020,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$two".to_string())) {
+            match markov_chain.generate(Some("$two".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(vec!["$two".to_string(), "$three".to_string()], result);
                 }
@@ -933,7 +1029,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$three".to_string())) {
+            match markov_chain.generate(Some("$three".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(vec!["$three".to_string()], result);
                 }
@@ -990,7 +1086,7 @@ mod tests {
             );
 
             for seed in vec!["One,", "one,", "One", "one"] {
-                match markov_chain.generate(Some(seed.to_string())) {
+                match markov_chain.generate(Some(seed.to_string()), None) {
                     Ok(result) => {
                         assert_eq!(
                             vec!["One,".to_string(), "two,".to_string(), "three!".to_string()],

@@ -103,12 +103,26 @@ pub fn read_chat_export(file_path: &str) -> Result<ChatExport, ReadError> {
         }
     }
 
+    // Only keep messages whose "from_id" starts with "user" or "channel"
+    export.messages.retain(|message| match &message.from_id {
+        None => false,
+        Some(id) => id.starts_with("user") || id.starts_with("channel"),
+    });
     for message in &mut export.messages {
         match &message.from_id {
             None => {}
             Some(id) => {
-                // Remove the "user" prefix from the user ID
-                message.from_id = Some(id.substring(4, id.len()).to_string());
+                // Remove the prefix from the user ID
+                if id.starts_with("user") {
+                    message.from_id = Some(id.substring(4, id.len()).to_string());
+                } else if id.starts_with("channel") {
+                    message.from_id = Some(id.substring(7, id.len()).to_string());
+                } else {
+                    panic!(
+                        "Expected prefix \"user\" or \"channel\" on \"from_id\" value: {}",
+                        id
+                    );
+                }
             }
         }
     }

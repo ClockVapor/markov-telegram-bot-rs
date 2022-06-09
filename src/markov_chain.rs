@@ -128,21 +128,21 @@ impl MarkovChain {
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct TripletMarkovChain {
-    /// `HashMap` of two words (#1 and #2) to `HashMap` of following word (#3) to number of times
+    /// [`HashMap`] of two words (#1 and #2) to [`HashMap`] of following word (#3) to number of times
     /// #3 has followed "#1 #2".
     data: HashMap<String, HashMap<String, Counter>>,
-    /// `HashMap` of word to `HashSet` of keys in `data` that end with the word. This is used to generate messages
+    /// [`HashMap`] of word to [`HashSet`] of keys in `data` that end with the word. This is used to generate messages
     /// with a given seed word.
     meta: HashMap<String, HashSet<String>>,
 }
 
 impl TripletMarkovChain {
-    /// Generates a `LinkedList` of words from the Markov chain. An optional seed word can be given to start with;
+    /// Generates a [`LinkedList`] of words from the Markov chain. An optional seed word can be given to start with;
     /// otherwise, a weighted random one will be chosen based on starting words in the Markov chain.
     pub fn generate(
         &self,
-        seed: Option<String>,
-        length_requirement: Option<LengthRequirement>,
+        seed: Option<&String>,
+        length_requirement: Option<&LengthRequirement>,
     ) -> Result<Vec<String>, MarkovChainError> {
         if self.data.is_empty() {
             return Err(Empty);
@@ -185,7 +185,7 @@ impl TripletMarkovChain {
         while !starts.is_empty() {
             let start = choose_from_frequency_map(&starts).clone();
             starts.remove(&start);
-            if let Ok(path) = self.generate_internal(&length_requirement, start, 0) {
+            if let Ok(path) = self.generate_internal(length_requirement, start, 0) {
                 let mut result = Vec::new();
                 for word in path {
                     result.push(word);
@@ -200,7 +200,7 @@ impl TripletMarkovChain {
     /// Internal function to recursively generate a message.
     fn generate_internal(
         &self,
-        length_requirement: &Option<LengthRequirement>,
+        length_requirement: Option<&LengthRequirement>,
         start: (String, String),
         current_length: i32,
     ) -> Result<LinkedList<String>, MarkovChainError> {
@@ -241,7 +241,7 @@ impl TripletMarkovChain {
         Err(MarkovChainError::CannotMeetLengthRequirement)
     }
 
-    /// Returns a `Vec` of all connections for the given starting pair, in a weighted random order.
+    /// Returns a [`Vec`] of all connections for the given starting pair, in a weighted random order.
     fn get_connections_in_weighted_random_order(
         &self,
         pair: &(String, String),
@@ -265,7 +265,7 @@ impl TripletMarkovChain {
         }
     }
 
-    /// Adds each word pair in the given &str (separated by whitespace) to the Markov chain.
+    /// Adds each word pair in the given `&str` (separated by whitespace) to the Markov chain.
     pub fn add_message(&mut self, text: &str) {
         let mut words = text.split_whitespace().peekable();
         if words.peek().is_some() {
@@ -381,13 +381,14 @@ pub enum MarkovChainError {
     InternalError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LengthRequirement {
     pub value: i32,
     pub comparison_operator: ComparisonOperator,
 }
 
 impl LengthRequirement {
-    /// Returns whether or not the `LengthRequirement` makes sense.
+    /// Returns whether or not the [`LengthRequirement`] makes sense.
     pub fn is_valid(&self) -> bool {
         match self.comparison_operator {
             ComparisonOperator::LessThan => self.value > 1,
@@ -398,6 +399,7 @@ impl LengthRequirement {
         }
     }
 
+    /// Returns the difference between `value` and `n`, the sign indicating whether more or less words are needed.
     pub fn difference(&self, n: i32) -> i32 {
         match self.comparison_operator {
             ComparisonOperator::LessThan => self.value - n - 1,
@@ -408,6 +410,7 @@ impl LengthRequirement {
         }
     }
 
+    /// Checks if the given `i32` is satisfied by this [`LengthRequirement`].
     pub fn is_satisfied_by(&self, n: i32) -> bool {
         match self.comparison_operator {
             ComparisonOperator::LessThan => n < self.value,
@@ -419,6 +422,7 @@ impl LengthRequirement {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComparisonOperator {
     LessThan,
     LessThanOrEqualTo,
@@ -503,7 +507,7 @@ fn decode_db_field_name(s: &str) -> String {
     }
 }
 
-/// Gets a `HashSet` of all encoded seed words associated with the given word.
+/// Gets a [`HashSet`] of all encoded seed words associated with the given word.
 fn get_associated_seeds_encoded(decoded_word: &str) -> HashSet<String> {
     let lowercase_encoded = encode_db_field_name(&decoded_word.to_lowercase());
     let cleaned_encoded = encode_db_field_name(
@@ -1008,7 +1012,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$one".to_string()), None) {
+            match markov_chain.generate(Some(&"$one".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(
                         vec!["$one".to_string(), "$two".to_string(), "$three".to_string()],
@@ -1020,7 +1024,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$two".to_string()), None) {
+            match markov_chain.generate(Some(&"$two".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(vec!["$two".to_string(), "$three".to_string()], result);
                 }
@@ -1029,7 +1033,7 @@ mod tests {
                 }
             }
 
-            match markov_chain.generate(Some("$three".to_string()), None) {
+            match markov_chain.generate(Some(&"$three".to_string()), None) {
                 Ok(result) => {
                     assert_eq!(vec!["$three".to_string()], result);
                 }
@@ -1086,7 +1090,7 @@ mod tests {
             );
 
             for seed in vec!["One,", "one,", "One", "one"] {
-                match markov_chain.generate(Some(seed.to_string()), None) {
+                match markov_chain.generate(Some(&seed.to_string()), None) {
                     Ok(result) => {
                         assert_eq!(
                             vec!["One,".to_string(), "two,".to_string(), "three!".to_string()],

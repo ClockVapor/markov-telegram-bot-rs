@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
+use std::num::ParseIntError;
 use std::sync::Mutex;
 
 use frankenstein::MessageEntityType::TextMention;
@@ -19,7 +20,7 @@ use substring::Substring;
 use MessageEntityType::Mention;
 
 use crate::import::{MessageContents, TextPiece};
-use crate::{import, read_chat_export, MarkovChainError, TripletMarkovChain};
+use crate::{import, read_chat_export, MarkovChainError, TripletMarkovChain, LengthRequirement, ComparisonOperator};
 
 /// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &str = "all";
@@ -38,6 +39,16 @@ type DbError = mongodb::error::Error;
 
 /// Affirmative responses to questions asked by the bot.
 static YES_STRINGS: [&str; 7] = ["y", "yes", "ye", "ya", "yeah", "yea", "yah"];
+
+lazy_static! {
+    static ref COMPARISON_OPERATORS: HashMap<&'static str, ComparisonOperator> = HashMap::from([
+        (">", ComparisonOperator::GreaterThan),
+        (">=", ComparisonOperator::GreaterThanOrEqualTo),
+        ("<", ComparisonOperator::LessThan),
+        ("<=", ComparisonOperator::LessThanOrEqualTo),
+        ("=", ComparisonOperator::EqualTo),
+    ]);
+}
 
 lazy_static! {
     /// Map of prompts that the bot is asking users. First key is chat ID, second key is user ID within that chat.
@@ -98,69 +109,66 @@ async fn handle_message(api: AsyncApi, db_url: &str, message: Message) {
         _ => {}
     };
 
-    if let Some(text) = &message.text {
-        // Check if the message is a reply to a prompt
-        if let Some(prompt) = original_prompt_for(&message) {
-            match prompt.handle_response(db_url, &message).await {
-                Err(e) => {
-                    error!("Failed to handle prompt response: {:?}", e);
-                    try_reply(&api, &message, "<an error occurred>".to_string()).await;
-                }
-                Ok(reply_text) => {
-                    remove_prompt(message.chat.id, &message.from.as_ref().unwrap().id);
-                    try_reply(&api, &message, reply_text).await;
-                }
-            }
-            return;
-        }
-
-        // Check for bot commands
-        if let Some(entities) = &message.entities {
-            if let Some(
-                command @ MessageEntity {
-                    type_field: MessageEntityType::BotCommand,
-                    ..
-                },
-            ) = entities.get(0)
-            {
-                if let Some(command_text) = text
-                    .get((command.offset + 1) as usize..(command.offset + command.length) as usize)
-                {
-                    if command_text == "msg" || command_text.starts_with("msg@") {
-                        handle_msg_command_message(
-                            db_url,
-                            &api,
-                            &message,
-                            text,
-                            entities.as_slice(),
-                        )
-                        .await;
-                    } else if command_text == "deletemydata"
-                        || command_text.starts_with("deletemydata@")
-                    {
-                        handle_delete_my_data_command_message(&api, &message).await;
-                    } else if command_text == "deleteusermydata"
-                        || command_text.starts_with("deleteuserdata@")
-                    {
-                        handle_delete_user_data_command_message(
-                            &api,
-                            db_url,
-                            &message,
-                            text,
-                            entities.as_slice(),
-                        )
-                        .await;
-                    }
-                }
-                return; // Don't add bot command messages to the Markov chain
-            }
-        }
-
-        // If message was not handled by some bot command, add it to the sending user's Markov chain
-        if let Err(e) = add_to_markov_chain(db_url, &message).await {
-            error!("Failed to add message to Markov chain: {:?}", e);
-        };
+    if message.text.is_none() {
+        return;
     }
+
+    let text = message.text.as_ref().unwrap();
+    // Check if the message is a reply to a prompt
+    if let Some(prompt) = original_prompt_for(&message) {
+        match prompt.handle_response(db_url, &message).await {
+            Err(e) => {
+                error!("Failed to handle prompt response: {:?}", e);
+                try_reply(&api, &message, "<an error occurred>".to_string()).await;
+            }
+            Ok(reply_text) => {
+                remove_prompt(message.chat.id, &message.from.as_ref().unwrap().id);
+                try_reply(&api, &message, reply_text).await;
+            }
+        }
+        return;
+    }
+
+    // Check for bot commands
+    if let Some(entities) = &message.entities {
+        if let Some(
+            command @ MessageEntity {
+                type_field: MessageEntityType::BotCommand,
+                ..
+            },
+        ) = entities.get(0)
+        {
+            if let Some(command_text) =
+                text.get((command.offset + 1) as usize..(command.offset + command.length) as usize)
+            {
+                if command_text == "msg" || command_text.starts_with("msg@") {
+                    handle_msg_command_message(db_url, &api, &message, text, entities.as_slice())
+                        .await;
+                } else if command_text == "deletemydata"
+                    || command_text.starts_with("deletemydata@")
+                {
+                    handle_delete_my_data_command_message(&api, &message).await;
+                } else if command_text == "deleteusermydata"
+                    || command_text.starts_with("deleteuserdata@")
+                {
+                    handle_delete_user_data_command_message(
+                        &api,
+                        db_url,
+                        &message,
+                        text,
+                        entities.as_slice(),
+                    )
+                    .await;
+                }
+            }
+            return; // Don't add bot command messages to the Markov chain
+        }
+    }
+
+    // If message was not handled by some bot command, add it to the sending user's Markov chain
+    if let Err(e) = add_to_markov_chain(db_url, &message).await {
+        error!("Failed to add message to Markov chain: {:?}", e);
+    };
 }
 
 /// Handles a message with a /deletemydata command.
@@ -389,14 +397,47 @@ async fn handle_msg_command_message(
     text: &str,
     entities: &[MessageEntity],
 ) {
+    let reply_text = match parse_msg_command_params(text, entities) {
+        Err(e) => match e {
+            MsgCommandParamsError::TooManySeeds => "<up to one seed word can be provided>".to_string(),
+            MsgCommandParamsError::ParseIntError(s) => format!("<invalid integer in length requirement \"{}\">", s).to_string(),
+        },
+        Ok(params) => {
+            debug!("Got /msg for {:?} in chat {}", params.source, message.chat.id);
+             match do_msg_command(db_url, &message.chat.id, &params).await {
+                Ok(Some(text)) => text,
+                Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
+                    "<no data>".to_string()
+                }
+                Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
+                    "<no such seed>".to_string()
+                }
+                Err(MsgCommandError::MarkovChainError(
+                        MarkovChainError::LengthRequirementInvalid,
+                    )) => "<invalid length requirement>".to_string(),
+                Err(MsgCommandError::MarkovChainError(
+                        MarkovChainError::CannotMeetLengthRequirement,
+                    )) => "<could not meet length requirement>".to_string(),
+                Err(e) => {
+                    error!("An error occurred executing /msg command: {:?}", e);
+                    "<an error occurred>".to_string()
+                }
+            }
+        }
+    };
+    try_reply(api, message, reply_text).await;
+}
+
+fn parse_msg_command_params<'a>(text: &str, entities: &'a [MessageEntity]) -> Result<MsgCommandParams<'a>, MsgCommandParamsError> {
+    // /msg [mention] [seed] [length requirement]
     let command_entity = entities.get(0).unwrap();
-    let (source, seed) = match entities.get(1) {
+    let (source, remaining_text) = match entities.get(1) {
         Some(entity) => {
             if let Some(user_mention) = get_user_mention(text, entity) {
                 let remaining_text = text
                     .substring((entity.offset + entity.length) as usize, text.len())
                     .trim();
-                (Source::SingleUser(user_mention), get_seed(remaining_text))
+                (Source::SingleUser(user_mention), remaining_text)
             } else {
                 let remaining_text = text
                     .substring(
@@ -404,7 +445,7 @@ async fn handle_msg_command_message(
                         text.len(),
                     )
                     .trim();
-                (Source::AllUsers, get_seed(remaining_text))
+                (Source::AllUsers, remaining_text)
             }
         }
         None => {
@@ -414,39 +455,72 @@ async fn handle_msg_command_message(
                     text.len(),
                 )
                 .trim();
-            (Source::AllUsers, get_seed(remaining_text))
+            (Source::AllUsers, remaining_text)
         }
     };
 
-    let reply_text = {
-        debug!("Got /msg for {:?} in chat {}", source, message.chat.id);
-        match seed {
-            Err(e) => e,
-            Ok(seed) => match do_msg_command(db_url, &message.chat.id, &source, seed).await {
-                Ok(Some(text)) => text,
-                Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
-                    "<no data>".to_string()
+    let parts: Vec<&str> = remaining_text.split_whitespace().collect();
+    let (seed, length_requirement) = match parts.len() {
+        // Neither
+        0 => (None, None),
+
+        // Seed or length requirement
+        1 => {
+            match parse_length_requirement(parts[0]) {
+                Err(_) => {
+                    return Err(MsgCommandParamsError::ParseIntError(parts[0].to_string()));
                 }
-                Err(MsgCommandError::MarkovChainError(MarkovChainError::NoSuchSeed)) => {
-                    "<no such seed>".to_string()
+                Ok(None) => (Some(parts[0].to_string()), None),
+                Ok(Some(length_requirement)) => (None, Some(length_requirement)),
+            }
+        }
+
+        // Seed and length requirement
+        2 => {
+            match parse_length_requirement(parts[1]) {
+                Err(_) => {
+                    return Err(MsgCommandParamsError::ParseIntError(parts[1].to_string()));
                 }
-                Err(MsgCommandError::MarkovChainError(
-                    MarkovChainError::LengthRequirementInvalid,
-                )) => "<invalid length requirement>".to_string(),
-                Err(MsgCommandError::MarkovChainError(
-                    MarkovChainError::CannotMeetLengthRequirement,
-                )) => "<could not meet length requirement>".to_string(),
-                Err(e) => {
-                    error!("An error occurred executing /msg command: {:?}", e);
-                    "<an error occurred>".to_string()
+                Ok(None) => {
+                    return Err(MsgCommandParamsError::TooManySeeds);
                 }
-            },
+                Ok(Some(length_requirement)) => (Some(parts[0].to_string()), Some(length_requirement)),
+            }
+        }
+
+        // Too many arguments
+        _ => {
+            return Err(MsgCommandParamsError::TooManySeeds);
         }
     };
-    try_reply(api, message, reply_text).await;
+
+    Ok(MsgCommandParams {
+        source,
+        seed,
+        length_requirement,
+    })
 }
 
-/// Parses up to one seed value from the given string. Err is returned if more than one seed value is given.
+fn parse_length_requirement(s: &str) -> Result<Option<LengthRequirement>, ParseIntError> {
+    for (prefix, comparison_operator) in COMPARISON_OPERATORS.iter() {
+        if s.starts_with(prefix) {
+            let value = s.substring(prefix.len(), s.len()).parse::<i32>()?;
+            return Ok(Some(LengthRequirement {
+                value,
+                comparison_operator: (*comparison_operator).clone(),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+struct MsgCommandParams<'a> {
+    source: Source<'a>,
+    seed: Option<String>,
+    length_requirement: Option<LengthRequirement>,
+}
+
+/// Parses up to one seed value from the given string. [`Err`] is returned if more than one seed value is given.
 fn get_seed(text: &str) -> Result<Option<String>, String> {
     let parts: Vec<&str> = text.split_whitespace().collect();
     match parts.len().cmp(&1_usize) {
@@ -497,10 +571,9 @@ async fn remember_message_sender(db_url: &str, message: &Message) -> Result<(), 
 async fn do_msg_command<'a>(
     db_url: &str,
     chat_id: &i64,
-    source: &Source<'a>,
-    seed: Option<String>,
+    params: &MsgCommandParams<'a>,
 ) -> Result<Option<String>, MsgCommandError> {
-    let user_id = match source {
+    let user_id = match &params.source {
         Source::SingleUser(target_user_mention) => target_user_mention.user_id(db_url).await,
         Source::AllUsers => Ok(Some(ALL.to_string())),
     };
@@ -512,7 +585,8 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
-                Some(markov_chain) => match markov_chain.generate(seed, None) {
+                Some(markov_chain) => match markov_chain.generate(params.seed.as_ref(),
+                                                                  params.length_requirement.as_ref()) {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
                 },
@@ -828,7 +902,14 @@ impl<'a> UserMention<'a> {
 }
 
 #[derive(Debug)]
+enum MsgCommandParamsError {
+    TooManySeeds,
+    ParseIntError(String),
+}
+
+#[derive(Debug)]
 enum MsgCommandError {
     DbError(DbError),
     MarkovChainError(MarkovChainError),
+    TooManySeeds,
 }

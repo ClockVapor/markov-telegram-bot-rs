@@ -40,15 +40,15 @@ type DbError = mongodb::error::Error;
 /// Affirmative responses to questions asked by the bot.
 static YES_STRINGS: [&str; 7] = ["y", "yes", "ye", "ya", "yeah", "yea", "yah"];
 
-lazy_static! {
-    static ref COMPARISON_OPERATORS: HashMap<&'static str, ComparisonOperator> = HashMap::from([
-        (">", ComparisonOperator::GreaterThan),
-        (">=", ComparisonOperator::GreaterThanOrEqualTo),
-        ("<", ComparisonOperator::LessThan),
-        ("<=", ComparisonOperator::LessThanOrEqualTo),
-        ("=", ComparisonOperator::EqualTo),
-    ]);
-}
+static COMPARISON_OPERATORS: [(&str, ComparisonOperator); 5] = [
+    // Note that the "or equal to" operators are before the regular ones. This is because we check for the operator
+    // as a prefix, and we need to use the longer one first before we find a false match of the shorter one.
+    (">=", ComparisonOperator::GreaterThanOrEqualTo),
+    (">", ComparisonOperator::GreaterThan),
+    ("<=", ComparisonOperator::LessThanOrEqualTo),
+    ("<", ComparisonOperator::LessThan),
+    ("=", ComparisonOperator::EqualTo),
+];
 
 lazy_static! {
     /// Map of prompts that the bot is asking users. First key is chat ID, second key is user ID within that chat.
@@ -502,12 +502,12 @@ fn parse_msg_command_params<'a>(text: &str, entities: &'a [MessageEntity]) -> Re
 }
 
 fn parse_length_requirement(s: &str) -> Result<Option<LengthRequirement>, ParseIntError> {
-    for (prefix, comparison_operator) in COMPARISON_OPERATORS.iter() {
+    for (prefix, comparison_operator) in COMPARISON_OPERATORS {
         if s.starts_with(prefix) {
             let value = s.substring(prefix.len(), s.len()).parse::<i32>()?;
             return Ok(Some(LengthRequirement {
                 value,
-                comparison_operator: (*comparison_operator).clone(),
+                comparison_operator: comparison_operator.clone(),
             }));
         }
     }
@@ -911,5 +911,4 @@ enum MsgCommandParamsError {
 enum MsgCommandError {
     DbError(DbError),
     MarkovChainError(MarkovChainError),
-    TooManySeeds,
 }

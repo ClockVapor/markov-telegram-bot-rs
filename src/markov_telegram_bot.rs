@@ -20,7 +20,10 @@ use substring::Substring;
 use MessageEntityType::Mention;
 
 use crate::import::{MessageContents, TextPiece};
-use crate::{import, read_chat_export, MarkovChainError, TripletMarkovChain, LengthRequirement, ComparisonOperator};
+use crate::{
+    import, read_chat_export, ComparisonOperator, LengthRequirement, MarkovChainError,
+    TripletMarkovChain,
+};
 
 /// Virtual "user ID" for Markov chain of all users in a chat.
 const ALL: &str = "all";
@@ -105,9 +108,7 @@ async fn handle_message(api: AsyncApi, db_url: &str, message: Message) {
     }
 
     // Don't care if this doesn't work here
-    match remember_message_sender(db_url, &message).await {
-        _ => {}
-    };
+    remember_message_sender(db_url, &message).await;
 
     if message.text.is_none() {
         return;
@@ -399,12 +400,19 @@ async fn handle_msg_command_message(
 ) {
     let reply_text = match parse_msg_command_params(text, entities) {
         Err(e) => match e {
-            MsgCommandParamsError::TooManySeeds => "<up to one seed word can be provided>".to_string(),
-            MsgCommandParamsError::ParseIntError(s) => format!("<invalid integer in length requirement \"{}\">", s).to_string(),
+            MsgCommandParamsError::TooManySeeds => {
+                "<up to one seed word can be provided>".to_string()
+            }
+            MsgCommandParamsError::ParseIntError(s) => {
+                format!("<invalid integer in length requirement \"{}\">", s)
+            }
         },
         Ok(params) => {
-            debug!("Got /msg for {:?} in chat {}", params.source, message.chat.id);
-             match do_msg_command(db_url, &message.chat.id, &params).await {
+            debug!(
+                "Got /msg for {:?} in chat {}",
+                params.source, message.chat.id
+            );
+            match do_msg_command(db_url, &message.chat.id, &params).await {
                 Ok(Some(text)) => text,
                 Ok(None) | Err(MsgCommandError::MarkovChainError(MarkovChainError::Empty)) => {
                     "<no data>".to_string()
@@ -413,11 +421,11 @@ async fn handle_msg_command_message(
                     "<no such seed>".to_string()
                 }
                 Err(MsgCommandError::MarkovChainError(
-                        MarkovChainError::LengthRequirementInvalid,
-                    )) => "<invalid length requirement>".to_string(),
+                    MarkovChainError::LengthRequirementInvalid,
+                )) => "<invalid length requirement>".to_string(),
                 Err(MsgCommandError::MarkovChainError(
-                        MarkovChainError::CannotMeetLengthRequirement,
-                    )) => "<could not meet length requirement>".to_string(),
+                    MarkovChainError::CannotMeetLengthRequirement,
+                )) => "<could not meet length requirement>".to_string(),
                 Err(e) => {
                     error!("An error occurred executing /msg command: {:?}", e);
                     "<an error occurred>".to_string()
@@ -428,7 +436,10 @@ async fn handle_msg_command_message(
     try_reply(api, message, reply_text).await;
 }
 
-fn parse_msg_command_params<'a>(text: &str, entities: &'a [MessageEntity]) -> Result<MsgCommandParams<'a>, MsgCommandParamsError> {
+fn parse_msg_command_params<'a>(
+    text: &str,
+    entities: &'a [MessageEntity],
+) -> Result<MsgCommandParams<'a>, MsgCommandParamsError> {
     // /msg [mention] [seed] [length requirement]
     let command_entity = entities.get(0).unwrap();
     let (source, remaining_text) = match entities.get(1) {
@@ -465,28 +476,24 @@ fn parse_msg_command_params<'a>(text: &str, entities: &'a [MessageEntity]) -> Re
         0 => (None, None),
 
         // Seed or length requirement
-        1 => {
-            match parse_length_requirement(parts[0]) {
-                Err(_) => {
-                    return Err(MsgCommandParamsError::ParseIntError(parts[0].to_string()));
-                }
-                Ok(None) => (Some(parts[0].to_string()), None),
-                Ok(Some(length_requirement)) => (None, Some(length_requirement)),
+        1 => match parse_length_requirement(parts[0]) {
+            Err(_) => {
+                return Err(MsgCommandParamsError::ParseIntError(parts[0].to_string()));
             }
-        }
+            Ok(None) => (Some(parts[0].to_string()), None),
+            Ok(Some(length_requirement)) => (None, Some(length_requirement)),
+        },
 
         // Seed and length requirement
-        2 => {
-            match parse_length_requirement(parts[1]) {
-                Err(_) => {
-                    return Err(MsgCommandParamsError::ParseIntError(parts[1].to_string()));
-                }
-                Ok(None) => {
-                    return Err(MsgCommandParamsError::TooManySeeds);
-                }
-                Ok(Some(length_requirement)) => (Some(parts[0].to_string()), Some(length_requirement)),
+        2 => match parse_length_requirement(parts[1]) {
+            Err(_) => {
+                return Err(MsgCommandParamsError::ParseIntError(parts[1].to_string()));
             }
-        }
+            Ok(None) => {
+                return Err(MsgCommandParamsError::TooManySeeds);
+            }
+            Ok(Some(length_requirement)) => (Some(parts[0].to_string()), Some(length_requirement)),
+        },
 
         // Too many arguments
         _ => {
@@ -507,7 +514,7 @@ fn parse_length_requirement(s: &str) -> Result<Option<LengthRequirement>, ParseI
             let value = s.substring(prefix.len(), s.len()).parse::<i32>()?;
             return Ok(Some(LengthRequirement {
                 value,
-                comparison_operator: comparison_operator.clone(),
+                comparison_operator,
             }));
         }
     }
@@ -585,8 +592,9 @@ async fn do_msg_command<'a>(
             Ok(None) => Ok(None),
             Ok(Some(chat_data)) => match chat_data.data.get(&user_id.to_string()) {
                 None => Ok(None),
-                Some(markov_chain) => match markov_chain.generate(params.seed.as_ref(),
-                                                                  params.length_requirement.as_ref()) {
+                Some(markov_chain) => match markov_chain
+                    .generate(params.seed.as_ref(), params.length_requirement.as_ref())
+                {
                     Err(e) => Err(MsgCommandError::MarkovChainError(e)),
                     Ok(words) => Ok(Some(words.join(" "))),
                 },
@@ -614,7 +622,7 @@ async fn try_reply(api: &AsyncApi, reply_to_message: &Message, text: String) -> 
 
 /// Adds a message to its sender's Markov chain and the "all users" Markov chain in the chat.
 async fn add_to_markov_chain(db_url: &str, message: &Message) -> Result<(), DbError> {
-    let text = message.text.as_ref().or(message.caption.as_ref());
+    let text = message.text.as_ref().or_else(|| message.caption.as_ref());
     match text {
         Some(text) => {
             let mut chat_data = read_chat_data(db_url, &message.chat.id)
@@ -662,10 +670,10 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
             let from_id = from_id_str.parse::<u64>().unwrap();
 
             // Fetch the user info from Telegram if we haven't yet
-            if let Vacant(entry) = users_cache.entry(from_id.clone()) {
+            if let Vacant(entry) = users_cache.entry(from_id) {
                 let params = GetChatMemberParams {
                     chat_id: ChatId::Integer(chat_data.chat_id),
-                    user_id: from_id.clone(),
+                    user_id: from_id,
                 };
                 match api.get_chat_member(&params).await {
                     Err(e) => {
@@ -694,7 +702,7 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
                         MessageContents::Pieces(pieces) => {
                             if !pieces.is_empty() {
                                 if let TextPiece::Entity(entity) = &pieces[0] {
-                                    entity.type_field != "bot_command".to_string()
+                                    entity.type_field != *"bot_command"
                                 } else {
                                     true
                                 }
@@ -714,7 +722,7 @@ async fn import_chat(api: &AsyncApi, db_url: &str, file_path: &str) -> Result<()
         }
     }
 
-    let chat_id = chat_data.chat_id.clone();
+    let chat_id = chat_data.chat_id;
     if let Err(e) = write_chat_data(db_url, chat_data).await {
         return Err(ImportError::DbError(e));
     }
@@ -739,7 +747,7 @@ async fn read_chat_data(db_url: &str, chat_id: &i64) -> Result<Option<ChatData>,
     let db = connect_to_db(db_url).await?;
     let collection = db.collection(CHATS_COLLECTION_NAME);
     let result = collection
-        .find_one(doc! {CHAT_ID_KEY: chat_id.clone()}, None)
+        .find_one(doc! {CHAT_ID_KEY: *chat_id}, None)
         .await;
     match result {
         Ok(chat_data) => {
@@ -762,10 +770,10 @@ async fn write_chat_data(db_url: &str, chat_data: ChatData) -> Result<(), DbErro
         replace_options.upsert = Some(true); // Insert new document if an existing one isn't found
         replace_options
     };
-    let chat_id = chat_data.chat_id.clone();
+    let chat_id = chat_data.chat_id;
     let result = collection
         .replace_one(
-            doc! {CHAT_ID_KEY: chat_data.chat_id.clone()},
+            doc! {CHAT_ID_KEY: chat_data.chat_id},
             chat_data,
             Some(replace_options),
         )
@@ -812,7 +820,7 @@ fn get_user_mention<'a>(text: &str, entity: &'a MessageEntity) -> Option<UserMen
             Some(UserMention::AtMention(username))
         }
 
-        TextMention => Some(UserMention::TextMention(&entity.user.as_ref().unwrap())),
+        TextMention => Some(UserMention::TextMention(entity.user.as_ref().unwrap())),
 
         _ => None,
     }
@@ -831,7 +839,7 @@ struct ChatData {
 impl ChatData {
     /// Adds a Telegram message to a user's Markov chain.
     fn add_message(&mut self, user_id: String, text: &str) {
-        match self.data.entry(user_id.clone()) {
+        match self.data.entry(user_id) {
             Occupied(mut entry) => {
                 entry.get_mut().add_message(text);
             }

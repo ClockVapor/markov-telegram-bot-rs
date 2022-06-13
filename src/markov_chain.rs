@@ -84,8 +84,8 @@ impl MarkovChain {
 
     /// Adds a single count to a pair of words in the Markov chain.
     fn add_word_pair(&mut self, first: &str, second: &str) {
-        let first = encode_db_field_name(&first);
-        let second = encode_db_field_name(&second);
+        let first = encode_db_field_name(first);
+        let second = encode_db_field_name(second);
 
         match self.data.get_mut(first.as_str()) {
             Some(word_map) => match word_map.get(&second) {
@@ -107,8 +107,8 @@ impl MarkovChain {
 
     /// Removes a given count from a pair of words in the Markov chain.
     fn remove_word_pair(&mut self, first: &str, second: &str, amount: &Counter) {
-        let first = encode_db_field_name(&first);
-        let second = encode_db_field_name(&second);
+        let first = encode_db_field_name(first);
+        let second = encode_db_field_name(second);
 
         if let Some(word_map) = self.data.get_mut(first.as_str()) {
             if let Some(count) = word_map.get(&second) {
@@ -147,7 +147,7 @@ impl TripletMarkovChain {
         if self.data.is_empty() {
             return Err(Empty);
         }
-        if let Some(ref length_requirement) = length_requirement {
+        if let Some(length_requirement) = length_requirement {
             if !length_requirement.is_valid() {
                 return Err(LengthRequirementInvalid);
             }
@@ -335,7 +335,7 @@ impl TripletMarkovChain {
     /// Removes a given count from a triplet of words in the Markov chain.
     fn remove_word_triplet(&mut self, pair: &(String, String), third: &str, amount: &Counter) {
         let pair_string_encoded = pair_to_string(pair);
-        let third_encoded = encode_db_field_name(&third);
+        let third_encoded = encode_db_field_name(third);
         if let Some(word_map) = self.data.get_mut(&pair_string_encoded) {
             if let Some(count) = word_map.get(&third_encoded) {
                 let new_count = count - amount;
@@ -465,7 +465,7 @@ fn pair_to_string(pair: &(String, String)) -> String {
     );
 
     let mut result = pair.0.clone();
-    result.push_str(" ");
+    result.push(' ');
     result.push_str(pair.1.as_str());
     encode_db_field_name(&result)
 }
@@ -478,7 +478,7 @@ fn string_to_pair(s: &str) -> (String, String) {
         "string_to_pair() was given a blank string"
     );
 
-    match s.find(" ") {
+    match s.find(' ') {
         None => panic!("Invalid string given; contains no space: {}", s),
         Some(i) => (
             s.substring(0, i).to_string(),
@@ -489,7 +489,7 @@ fn string_to_pair(s: &str) -> (String, String) {
 
 /// MongoDB 4 doesn't let field names start with '$'.
 fn encode_db_field_name(s: &str) -> String {
-    if s.starts_with("$") {
+    if s.starts_with('$') {
         let mut result = s.to_string();
         result.insert(0, '\\');
         result

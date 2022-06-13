@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt::{Display, Formatter};
 use substring::Substring;
 
 use ReadError::{IoError, SerdeError};
@@ -26,9 +27,9 @@ pub struct Message {
     pub contents: MessageContents,
 }
 
-impl Message {
-    pub fn to_string(&self) -> String {
-        self.contents.to_string()
+impl Display for Message {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.contents.to_string())
     }
 }
 
@@ -39,15 +40,17 @@ pub enum MessageContents {
     Pieces(Vec<TextPiece>),
 }
 
-impl MessageContents {
-    pub fn to_string(&self) -> String {
+impl Display for MessageContents {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageContents::PlainText(text) => text.clone(),
-            MessageContents::Pieces(pieces) => pieces
-                .iter()
-                .map(|piece| piece.to_string())
-                .collect::<Vec<String>>()
-                .join(" "),
+            MessageContents::PlainText(text) => f.write_str(text),
+            MessageContents::Pieces(pieces) => f.write_str(
+                &pieces
+                    .iter()
+                    .map(|piece| piece.to_string())
+                    .collect::<Vec<String>>()
+                    .join(" "),
+            ),
         }
     }
 }
@@ -59,11 +62,11 @@ pub enum TextPiece {
     Entity(Entity),
 }
 
-impl TextPiece {
-    pub fn to_string(&self) -> String {
+impl Display for TextPiece {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            TextPiece::PlainText(text) => text.clone(),
-            TextPiece::Entity(entity) => entity.text.clone(),
+            TextPiece::PlainText(text) => f.write_str(text),
+            TextPiece::Entity(entity) => f.write_str(&entity.text),
         }
     }
 }

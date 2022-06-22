@@ -53,6 +53,9 @@ static COMPARISON_OPERATORS: [(&str, ComparisonOperator); 5] = [
     ("=", ComparisonOperator::EqualTo),
 ];
 
+/// Don't let users enforce message lengths greater than this.
+const MAX_LENGTH_REQUIREMENT: i32 = 500;
+
 lazy_static! {
     /// Map of prompts that the bot is asking users. First key is chat ID, second key is user ID within that chat.
     static ref PROMPTS: Mutex<HashMap<i64, HashMap<u64, Prompt>>> = Mutex::new(HashMap::new());
@@ -86,7 +89,7 @@ pub async fn run(
                         let api_clone = api.clone();
                         let db_url_clone = db_url.clone();
                         tokio::spawn(async move {
-                            handle_message(api_clone, db_url_clone.as_str(), message).await;
+                            handle_message(api_clone, &db_url_clone, message).await;
                         });
                         update_params = update_params_builder
                             .offset(update.update_id + 1)
@@ -406,6 +409,12 @@ async fn handle_msg_command_message(
             MsgCommandParamsError::ParseIntError(s) => {
                 format!("<invalid integer in length requirement \"{}\">", s)
             }
+            MsgCommandParamsError::LengthRequirementTooLarge => {
+                format!(
+                    "<length requirement is too large - max is {}>",
+                    MAX_LENGTH_REQUIREMENT
+                )
+            }
         },
         Ok(params) => {
             debug!(
@@ -481,7 +490,10 @@ fn parse_msg_command_params<'a>(
                 return Err(MsgCommandParamsError::ParseIntError(parts[0].to_string()));
             }
             Ok(None) => (Some(parts[0].to_string()), None),
-            Ok(Some(length_requirement)) => (None, Some(length_requirement)),
+            Ok(Some(length_requirement)) => {
+                validate_length_requirement(&length_requirement)?;
+                (None, Some(length_requirement))
+            }
         },
 
         // Seed and length requirement
@@ -492,7 +504,10 @@ fn parse_msg_command_params<'a>(
             Ok(None) => {
                 return Err(MsgCommandParamsError::TooManySeeds);
             }
-            Ok(Some(length_requirement)) => (Some(parts[0].to_string()), Some(length_requirement)),
+            Ok(Some(length_requirement)) => {
+                validate_length_requirement(&length_requirement)?;
+                (Some(parts[0].to_string()), Some(length_requirement))
+            }
         },
 
         // Too many arguments
@@ -519,6 +534,21 @@ fn parse_length_requirement(s: &str) -> Result<Option<LengthRequirement>, ParseI
         }
     }
     Ok(None)
+}
+
+/// Makes sure the given `LengthRequirement` isn't enforcing too large of a message length.
+fn validate_length_requirement(
+    length_requirement: &LengthRequirement,
+) -> Result<(), MsgCommandParamsError> {
+    if let ComparisonOperator::GreaterThan
+    | ComparisonOperator::GreaterThanOrEqualTo
+    | ComparisonOperator::EqualTo = length_requirement.comparison_operator
+    {
+        if length_requirement.value > MAX_LENGTH_REQUIREMENT {
+            return Err(MsgCommandParamsError::LengthRequirementTooLarge);
+        }
+    }
+    Ok(())
 }
 
 struct MsgCommandParams<'a> {
@@ -913,6 +943,7 @@ impl<'a> UserMention<'a> {
 enum MsgCommandParamsError {
     TooManySeeds,
     ParseIntError(String),
+    LengthRequirementTooLarge,
 }
 
 #[derive(Debug)]

@@ -1,4 +1,3 @@
-use std::cmp::Ordering;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashMap;
 use std::num::ParseIntError;
@@ -557,21 +556,14 @@ struct MsgCommandParams<'a> {
     length_requirement: Option<LengthRequirement>,
 }
 
-/// Parses up to one seed value from the given string. [`Err`] is returned if more than one seed value is given.
-fn get_seed(text: &str) -> Result<Option<String>, String> {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    match parts.len().cmp(&1_usize) {
-        Ordering::Equal => Ok(Some(parts.get(0).unwrap().to_string())),
-        Ordering::Greater => Err("<up to one seed word can be provided>".to_string()),
-        Ordering::Less => Ok(None),
-    }
-}
-
 /// Stores the message sender's username and user ID so that their username can be associated with their user ID.
-async fn remember_message_sender(db_url: &str, message: &Message) -> Result<(), DbError> {
+async fn remember_message_sender(db_url: &str, message: &Message) {
     if let Some(username) = &message.from.as_ref().unwrap().username {
         let username = username.to_lowercase();
-        let db = connect_to_db(db_url).await?;
+        let db = match connect_to_db(db_url).await {
+            Ok(db) => db,
+            Err(_) => return,
+        };
         let user_infos: Collection<UserInfo> = db.collection(USER_INFOS_COLLECTION_NAME);
         let replace_options = {
             let mut replace_options = ReplaceOptions::default();
@@ -588,13 +580,12 @@ async fn remember_message_sender(db_url: &str, message: &Message) -> Result<(), 
                 replace_options,
             )
             .await;
-        if let Err(e) = result {
+        if result.is_err() {
             error!(
                 "Failed to remember username {} has user_id {}",
                 &username,
                 message.from.as_ref().unwrap().id
             );
-            return Err(e);
         }
         debug!(
             "Remembered username {} has user_id {}",
@@ -602,7 +593,6 @@ async fn remember_message_sender(db_url: &str, message: &Message) -> Result<(), 
             message.from.as_ref().unwrap().id
         );
     }
-    Ok(())
 }
 
 async fn do_msg_command<'a>(

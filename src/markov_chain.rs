@@ -1,7 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, LinkedList};
 
-use log::error;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use substring::Substring;
@@ -10,7 +9,7 @@ use MarkovChainError::*;
 
 pub type Counter = i64;
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+/*#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkovChain {
     /// HashMap of word (#1) to HashMap of following word (#2) to number of times #2 has followed #1.
     data: HashMap<String, HashMap<String, Counter>>,
@@ -124,7 +123,7 @@ impl MarkovChain {
             }
         }
     }
-}
+}*/
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct TripletMarkovChain {
@@ -376,9 +375,8 @@ pub enum MarkovChainError {
 
     /// A length requirement was given for a generated message, but it couldn't be met.
     CannotMeetLengthRequirement,
-
-    /// Catch-all for unexpected Markov chain errors.
-    InternalError,
+    ///// Catch-all for unexpected Markov chain errors.
+    //InternalError,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

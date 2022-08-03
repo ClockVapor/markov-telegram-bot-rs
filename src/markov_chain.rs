@@ -556,7 +556,7 @@ mod tests {
         assert_eq!("$foo", decode_db_field_name("\\$foo"));
     }
 
-    mod markov_chain {
+    /*mod markov_chain {
         use super::*;
 
         #[test]
@@ -714,7 +714,7 @@ mod tests {
                 }
             }
         }
-    }
+    }*/
 
     mod triplet_markov_chain {
         use super::*;
